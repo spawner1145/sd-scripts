@@ -36,19 +36,32 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
             unet,
             logit_scale,
             ckpt_info,
+            llm_tokenizer,
+            llm_projection,
         ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
 
         self.load_stable_diffusion_format = load_stable_diffusion_format
         self.logit_scale = logit_scale
         self.ckpt_info = ckpt_info
+        self.llm_tokenizer = llm_tokenizer
+        self.llm_projection = llm_projection
 
-        return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
+        if args.llm_text_encoder:
+            return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1], vae, unet
+        else:
+            return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
 
     def get_tokenize_strategy(self, args):
-        return strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
+        if args.llm_text_encoder:
+            return strategy_sdxl.LlmTokenizeStrategy(self.llm_tokenizer, args.max_token_length)
+        else:
+            return strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
 
-    def get_tokenizers(self, tokenize_strategy: strategy_sdxl.SdxlTokenizeStrategy):
-        return [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]
+    def get_tokenizers(self, tokenize_strategy):
+        if hasattr(tokenize_strategy, 'tokenizer1'):
+            return [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]
+        else:
+            return [tokenize_strategy.tokenizer]
 
     def get_latents_caching_strategy(self, args):
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(

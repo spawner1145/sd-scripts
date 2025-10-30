@@ -154,6 +154,8 @@ def train(args):
         unet,
         logit_scale,
         ckpt_info,
+        llm_tokenizer,
+        llm_projection,
     ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
 
     # モデルに xformers とか memory efficient attention を組み込む

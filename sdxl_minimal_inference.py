@@ -109,38 +109,46 @@ if __name__ == "__main__":
         help="LoRA weights, only supports networks.lora, each argument is a `path;multiplier` (semi-colon separated)",
     )
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument(
+        "--llm_text_encoder",
+        type=str,
+        default=None,
+        help="Use LLM as text encoder instead of CLIP (path to LLM model folder) / CLIPの代わりにLLMをtext encoderとして使用 (LLMモデルのフォルダパス)",
+    )
+    parser.add_argument(
+        "--llm_system_prompt",
+        type=str,
+        default="",
+        help="System prompt for LLM text encoder / LLM text encoderのシステムプロンプト",
+    )
     args = parser.parse_args()
 
     if args.prompt2 is None:
         args.prompt2 = args.prompt
-
-    # HuggingFaceのmodel id
-    text_encoder_1_name = "openai/clip-vit-large-patch14"
-    text_encoder_2_name = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 
     # checkpointを読み込む。モデル変換についてはそちらの関数を参照
     # Load checkpoint. For model conversion, see this function
 
     # 本体RAMが少ない場合はGPUにロードするといいかも
     # If the main RAM is small, it may be better to load it on the GPU
-    text_model1, text_model2, vae, unet, _, _ = sdxl_model_util.load_models_from_sdxl_checkpoint(
-        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.ckpt_path, "cpu"
-    )
+    if args.llm_text_encoder:
+        # Load SDXL with LLM text encoder
+        text_model1, text_model2, llm_model, llm_tokenizer, vae, unet, _, _ = sdxl_model_util.load_models_from_sdxl_checkpoint_with_llm(
+            sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.ckpt_path, args.llm_text_encoder, "cpu"
+        )
+        text_encoder = llm_model
+        tokenizer = llm_tokenizer
+        use_llm = True
+    else:
+        # Load standard SDXL with CLIP text encoders
+        text_model1, text_model2, vae, unet, _, _ = sdxl_model_util.load_models_from_sdxl_checkpoint(
+            sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.ckpt_path, "cpu"
+        )
+        use_llm = False
 
-    # Text Encoder 1はSDXL本体でもHuggingFaceのものを使っている
-    # In SDXL, Text Encoder 1 is also using HuggingFace's
-
-    # Text Encoder 2はSDXL本体ではopen_clipを使っている
-    # それを使ってもいいが、SD2のDiffusers版に合わせる形で、HuggingFaceのものを使う
-    # 重みの変換コードはSD2とほぼ同じ
-    # In SDXL, Text Encoder 2 is using open_clip
-    # It's okay to use it, but to match the Diffusers version of SD2, use HuggingFace's
-    # The weight conversion code is almost the same as SD2
-
-    # VAEの構造はSDXLもSD1/2と同じだが、重みは異なるようだ。何より謎のscale値が違う
-    # fp16でNaNが出やすいようだ
-    # The structure of VAE is the same as SD1/2, but the weights seem to be different. Above all, the mysterious scale value is different.
-    # NaN seems to be more likely to occur in fp16
+        # HuggingFaceのmodel id
+        text_encoder_1_name = "openai/clip-vit-large-patch14"
+        text_encoder_2_name = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 
     unet.to(DEVICE, dtype=DTYPE)
     unet.eval()
@@ -152,19 +160,31 @@ if __name__ == "__main__":
     vae.to(DEVICE, dtype=vae_dtype)
     vae.eval()
 
-    text_model1.to(DEVICE, dtype=DTYPE)
-    text_model1.eval()
-    text_model2.to(DEVICE, dtype=DTYPE)
-    text_model2.eval()
+    if use_llm:
+        # LLM mode
+        text_encoder.to(DEVICE, dtype=DTYPE)
+        text_encoder.eval()
+        # Set dummy values for CLIP models (not used in LLM mode)
+        text_model1 = None
+        text_model2 = None
+    else:
+        # CLIP mode
+        text_model1.to(DEVICE, dtype=DTYPE)
+        text_model1.eval()
+        text_model2.to(DEVICE, dtype=DTYPE)
+        text_model2.eval()
 
     unet.set_use_memory_efficient_attention(True, False)
     if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
         vae.set_use_memory_efficient_attention_xformers(True)
 
     # Tokenizers
-    tokenizer1 = CLIPTokenizer.from_pretrained(text_encoder_1_name)
-    # tokenizer2 = lambda x: open_clip.tokenize(x, context_length=77)
-    tokenizer2 = CLIPTokenizer.from_pretrained(text_encoder_2_name)
+    if use_llm:
+        # LLM tokenizer is already loaded
+        pass
+    else:
+        tokenizer1 = CLIPTokenizer.from_pretrained(text_encoder_1_name)
+        tokenizer2 = CLIPTokenizer.from_pretrained(text_encoder_2_name)
 
     # LoRA
     for weights_file in args.lora_weights:
@@ -174,10 +194,18 @@ if __name__ == "__main__":
         else:
             multiplier = 1.0
 
-        lora_model, weights_sd = lora.create_network_from_weights(
-            multiplier, weights_file, vae, [text_model1, text_model2], unet, None, True
-        )
-        lora_model.merge_to([text_model1, text_model2], unet, weights_sd, DTYPE, DEVICE)
+        if use_llm:
+            # For LLM mode, pass LLM text encoder instead of CLIP models
+            lora_model, weights_sd = lora.create_network_from_weights(
+                multiplier, weights_file, vae, [text_encoder], unet, None, True
+            )
+            lora_model.merge_to([text_encoder], unet, weights_sd, DTYPE, DEVICE)
+        else:
+            # Standard CLIP mode
+            lora_model, weights_sd = lora.create_network_from_weights(
+                multiplier, weights_file, vae, [text_model1, text_model2], unet, None, True
+            )
+            lora_model.merge_to([text_model1, text_model2], unet, weights_sd, DTYPE, DEVICE)
 
     # scheduler
     scheduler = EulerDiscreteScheduler(
@@ -203,45 +231,70 @@ if __name__ == "__main__":
 
             # crossattn
 
-        # Text Encoderを二つ呼ぶ関数  Function to call two Text Encoders
-        def call_text_encoder(text, text2):
-            # text encoder 1
-            batch_encoding = tokenizer1(
-                text,
-                truncation=True,
-                return_length=True,
-                return_overflowing_tokens=False,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            tokens = batch_encoding["input_ids"].to(DEVICE)
+        # Text Encoderを呼ぶ関数  Function to call Text Encoder
+        if use_llm:
+            # LLM mode
+            def call_text_encoder(text, text2):
+                from library.strategy_sdxl import LlmTextEncodingStrategy
+                llm_strategy = LlmTextEncodingStrategy(
+                    system_prompt=args.llm_system_prompt,
+                    text_encoder=text_encoder  # Pass text_encoder for auto-projection
+                )
+                
+                # For LLM, we use a single text input (combine prompt and prompt2 if different)
+                combined_text = text if text == text2 else f"{text} {text2}"
+                
+                tokens = tokenizer(combined_text, return_tensors="pt", padding="max_length", truncation=True, max_length=256)
+                tokens = {k: v.to(DEVICE) for k, v in tokens.items()}
+                
+                with torch.no_grad():
+                    encoded_results = llm_strategy.encode_tokens(
+                        None, [text_encoder, tokenizer], [tokens['input_ids']]
+                    )
+                    encoder_hidden_states1, encoder_hidden_states2, pool2 = encoded_results
+                
+                # Concatenate for cross-attention (768 + 1280 = 2048)
+                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2)
+                return text_embedding, pool2
+        else:
+            # CLIP mode (original implementation)
+            def call_text_encoder(text, text2):
+                # text encoder 1
+                batch_encoding = tokenizer1(
+                    text,
+                    truncation=True,
+                    return_length=True,
+                    return_overflowing_tokens=False,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                tokens = batch_encoding["input_ids"].to(DEVICE)
 
-            with torch.no_grad():
-                enc_out = text_model1(tokens, output_hidden_states=True, return_dict=True)
-                text_embedding1 = enc_out["hidden_states"][11]
-                # text_embedding = pipe.text_encoder.text_model.final_layer_norm(text_embedding)    # layer normは通さないらしい
+                with torch.no_grad():
+                    enc_out = text_model1(tokens, output_hidden_states=True, return_dict=True)
+                    text_embedding1 = enc_out["hidden_states"][11]
+                    # text_embedding = pipe.text_encoder.text_model.final_layer_norm(text_embedding)    # layer normは通さないらしい
 
-            # text encoder 2
-            # tokens = tokenizer2(text2).to(DEVICE)
-            tokens = tokenizer2(
-                text,
-                truncation=True,
-                return_length=True,
-                return_overflowing_tokens=False,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            tokens = batch_encoding["input_ids"].to(DEVICE)
+                # text encoder 2
+                tokens = tokenizer2(
+                    text,
+                    truncation=True,
+                    return_length=True,
+                    return_overflowing_tokens=False,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                tokens = batch_encoding["input_ids"].to(DEVICE)
 
-            with torch.no_grad():
-                enc_out = text_model2(tokens, output_hidden_states=True, return_dict=True)
-                text_embedding2_penu = enc_out["hidden_states"][-2]
-                # logger.info("hidden_states2", text_embedding2_penu.shape)
-                text_embedding2_pool = enc_out["text_embeds"]  # do not support Textual Inversion
+                with torch.no_grad():
+                    enc_out = text_model2(tokens, output_hidden_states=True, return_dict=True)
+                    text_embedding2_penu = enc_out["hidden_states"][-2]
+                    # logger.info("hidden_states2", text_embedding2_penu.shape)
+                    text_embedding2_pool = enc_out["text_embeds"]  # do not support Textual Inversion
 
-            # 連結して終了 concat and finish
-            text_embedding = torch.cat([text_embedding1, text_embedding2_penu], dim=2)
-            return text_embedding, text_embedding2_pool
+                # 連結して終了 concat and finish
+                text_embedding = torch.cat([text_embedding1, text_embedding2_penu], dim=2)
+                return text_embedding, text_embedding2_pool
 
         # cond
         c_ctx, c_ctx_pool = call_text_encoder(prompt, prompt2)

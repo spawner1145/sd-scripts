@@ -77,10 +77,12 @@ def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List
     return params_to_optimize
 
 
-def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
+def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type, text_encoder2=None):
     names = []
     block_index = 0
-    while block_index < UNET_NUM_BLOCKS_FOR_BLOCK_LR + 2:
+    # Determine how many text encoders we have
+    num_text_encoders = 1 if text_encoder2 is None else 2
+    while block_index < UNET_NUM_BLOCKS_FOR_BLOCK_LR + num_text_encoders:
         if block_index < UNET_NUM_BLOCKS_FOR_BLOCK_LR:
             if block_lrs[block_index] == 0:
                 block_index += 1
@@ -88,7 +90,7 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
             names.append(f"block{block_index}")
         elif block_index == UNET_NUM_BLOCKS_FOR_BLOCK_LR:
             names.append("text_encoder1")
-        elif block_index == UNET_NUM_BLOCKS_FOR_BLOCK_LR + 1:
+        elif block_index == UNET_NUM_BLOCKS_FOR_BLOCK_LR + 1 and text_encoder2 is not None:
             names.append("text_encoder2")
 
         block_index += 1
@@ -123,10 +125,6 @@ def train(args):
 
     if args.seed is not None:
         set_seed(args.seed)  # 乱数系列を初期化する
-
-    tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
-    strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
-    tokenizers = [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]  # will be removed in the future
 
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:
@@ -224,8 +222,20 @@ def train(args):
         unet,
         logit_scale,
         ckpt_info,
+        llm_tokenizer,
+        llm_projection,
     ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
+
+    # Set up tokenize strategy based on model type
+    if args.llm_text_encoder:
+        tokenize_strategy = strategy_sdxl.LlmTokenizeStrategy(llm_tokenizer, args.max_token_length)
+        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+        tokenizers = [llm_tokenizer]
+    else:
+        tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
+        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+        tokenizers = [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]  # will be removed in the future
 
     # verify load/save model formats
     if load_stable_diffusion_format:
@@ -287,49 +297,72 @@ def train(args):
     train_text_encoder1 = False
     train_text_encoder2 = False
 
-    text_encoding_strategy = strategy_sdxl.SdxlTextEncodingStrategy()
-    strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
+    if args.llm_text_encoder:
+        # Use LLM text encoding strategy with auto-projection
+        text_encoding_strategy = strategy_sdxl.LlmTextEncodingStrategy(
+            projection=llm_projection,
+            system_prompt=args.llm_system_prompt,
+            text_encoder=text_encoder1  # Pass text_encoder for auto-projection if needed
+        )
+        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
+    else:
+        # Original dual CLIP strategy
+        text_encoding_strategy = strategy_sdxl.SdxlTextEncodingStrategy()
+        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
 
     if args.train_text_encoder:
         # TODO each option for two text encoders?
         accelerator.print("enable text encoder training")
         if args.gradient_checkpointing:
             text_encoder1.gradient_checkpointing_enable()
-            text_encoder2.gradient_checkpointing_enable()
+            if text_encoder2 is not None:
+                text_encoder2.gradient_checkpointing_enable()
         lr_te1 = args.learning_rate_te1 if args.learning_rate_te1 is not None else args.learning_rate  # 0 means not train
         lr_te2 = args.learning_rate_te2 if args.learning_rate_te2 is not None else args.learning_rate  # 0 means not train
         train_text_encoder1 = lr_te1 != 0
-        train_text_encoder2 = lr_te2 != 0
+        train_text_encoder2 = lr_te2 != 0 if text_encoder2 is not None else False
 
         # caching one text encoder output is not supported
         if not train_text_encoder1:
             text_encoder1.to(weight_dtype)
-        if not train_text_encoder2:
+        if text_encoder2 is not None and not train_text_encoder2:
             text_encoder2.to(weight_dtype)
         text_encoder1.requires_grad_(train_text_encoder1)
-        text_encoder2.requires_grad_(train_text_encoder2)
+        if text_encoder2 is not None:
+            text_encoder2.requires_grad_(train_text_encoder2)
         text_encoder1.train(train_text_encoder1)
-        text_encoder2.train(train_text_encoder2)
+        if text_encoder2 is not None:
+            text_encoder2.train(train_text_encoder2)
     else:
         text_encoder1.to(weight_dtype)
-        text_encoder2.to(weight_dtype)
+        if text_encoder2 is not None:
+            text_encoder2.to(weight_dtype)
         text_encoder1.requires_grad_(False)
-        text_encoder2.requires_grad_(False)
+        if text_encoder2 is not None:
+            text_encoder2.requires_grad_(False)
         text_encoder1.eval()
-        text_encoder2.eval()
+        if text_encoder2 is not None:
+            text_encoder2.eval()
 
         # TextEncoderの出力をキャッシュする
         if args.cache_text_encoder_outputs:
             # Text Encodes are eval and no grad
-            text_encoder_output_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, None, False, is_weighted=args.weighted_captions
-            )
+            if args.llm_text_encoder:
+                text_encoder_output_caching_strategy = strategy_sdxl.LlmTextEncoderOutputsCachingStrategy(
+                    args.cache_text_encoder_outputs_to_disk, None, False, is_weighted=args.weighted_captions
+                )
+            else:
+                text_encoder_output_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
+                    args.cache_text_encoder_outputs_to_disk, None, False, is_weighted=args.weighted_captions
+                )
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_output_caching_strategy)
 
             text_encoder1.to(accelerator.device)
-            text_encoder2.to(accelerator.device)
+            if text_encoder2 is not None:
+                text_encoder2.to(accelerator.device)
             with accelerator.autocast():
-                train_dataset_group.new_cache_text_encoder_outputs([text_encoder1, text_encoder2], accelerator)
+                text_encoders = [text_encoder1] if text_encoder2 is None else [text_encoder1, text_encoder2]
+                train_dataset_group.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
         accelerator.wait_for_everyone()
 
@@ -354,7 +387,7 @@ def train(args):
     if train_text_encoder1:
         training_models.append(text_encoder1)
         params_to_optimize.append({"params": list(text_encoder1.parameters()), "lr": args.learning_rate_te1 or args.learning_rate})
-    if train_text_encoder2:
+    if train_text_encoder2 and text_encoder2 is not None:
         training_models.append(text_encoder2)
         params_to_optimize.append({"params": list(text_encoder2.parameters()), "lr": args.learning_rate_te2 or args.learning_rate})
 
@@ -658,31 +691,53 @@ def train(args):
                     encoder_hidden_states2 = encoder_hidden_states2.to(accelerator.device, dtype=weight_dtype)
                     pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
                 else:
-                    input_ids1, input_ids2 = batch["input_ids_list"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
-                        # Get the text embedding for conditioning
-                        if args.weighted_captions:
-                            input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = (
-                                text_encoding_strategy.encode_tokens_with_weights(
+                    if args.llm_text_encoder:
+                        # LLM text encoding
+                        with torch.set_grad_enabled(args.train_text_encoder):
+                            if args.weighted_captions:
+                                input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens_with_weights(
                                     tokenize_strategy,
-                                    [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                    [text_encoder1, llm_tokenizer],
                                     input_ids_list,
                                     weights_list,
+                                    batch["captions"],
                                 )
-                            )
-                        else:
-                            input_ids1 = input_ids1.to(accelerator.device)
-                            input_ids2 = input_ids2.to(accelerator.device)
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
-                                tokenize_strategy,
-                                [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
-                                [input_ids1, input_ids2],
-                            )
-                        if args.full_fp16:
-                            encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
-                            encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
-                            pool2 = pool2.to(weight_dtype)
+                            else:
+                                input_ids = batch["input_ids_list"][0]  # Single input for LLM
+                                input_ids = input_ids.to(accelerator.device)
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
+                                    tokenize_strategy,
+                                    [text_encoder1, llm_tokenizer],
+                                    [input_ids],
+                                )
+                    else:
+                        # Original dual CLIP encoding
+                        input_ids1, input_ids2 = batch["input_ids_list"]
+                        with torch.set_grad_enabled(args.train_text_encoder):
+                            # Get the text embedding for conditioning
+                            if args.weighted_captions:
+                                input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = (
+                                    text_encoding_strategy.encode_tokens_with_weights(
+                                        tokenize_strategy,
+                                        [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                        input_ids_list,
+                                        weights_list,
+                                    )
+                                )
+                            else:
+                                input_ids1 = input_ids1.to(accelerator.device)
+                                input_ids2 = input_ids2.to(accelerator.device)
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
+                                    tokenize_strategy,
+                                    [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                    [input_ids1, input_ids2],
+                                )
+                    if args.full_fp16:
+                        encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
+                        encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
+                        pool2 = pool2.to(weight_dtype)
 
                 # get size embeddings
                 orig_size = batch["original_sizes_hw"]
@@ -795,6 +850,7 @@ def train(args):
                             vae,
                             logit_scale,
                             ckpt_info,
+                            save_unet_only=args.save_unet_only,
                         )
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
@@ -803,7 +859,7 @@ def train(args):
                 if block_lrs is None:
                     train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=train_unet)
                 else:
-                    append_block_lr_to_logs(block_lrs, logs, lr_scheduler, args.optimizer_type)  # U-Net is included in block_lrs
+                    append_block_lr_to_logs(block_lrs, logs, lr_scheduler, args.optimizer_type, text_encoder2)  # U-Net is included in block_lrs
 
                 accelerator.log(logs, step=global_step)
 
@@ -841,6 +897,7 @@ def train(args):
                     vae,
                     logit_scale,
                     ckpt_info,
+                    save_unet_only=args.save_unet_only,
                 )
 
         sdxl_train_util.sample_images(
@@ -884,6 +941,7 @@ def train(args):
             vae,
             logit_scale,
             ckpt_info,
+            save_unet_only=args.save_unet_only,
         )
         logger.info("model saved.")
 

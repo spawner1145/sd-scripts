@@ -79,10 +79,6 @@ def train(args):
         args.seed = random.randint(0, 2**32)
     set_seed(args.seed)
 
-    tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
-    strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
-    tokenizer1, tokenizer2 = tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2  # this is used for sampling images
-
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
         False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
@@ -171,7 +167,28 @@ def train(args):
         unet,
         logit_scale,
         ckpt_info,
+        llm_tokenizer,
+        llm_projection,
     ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
+
+    # Set up tokenize strategy based on model type
+    if args.llm_text_encoder:
+        tokenize_strategy = strategy_sdxl.LlmTokenizeStrategy(llm_tokenizer, args.max_token_length)
+        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+        tokenizer1, tokenizer2 = llm_tokenizer, None  # For compatibility
+        # Set text encoding strategy
+        text_encoding_strategy = strategy_sdxl.LlmTextEncodingStrategy(
+            projection=llm_projection,
+            system_prompt=args.llm_system_prompt,
+            text_encoder=text_encoder1  # Pass text_encoder for auto-projection
+        )
+        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
+    else:
+        tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
+        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+        tokenizer1, tokenizer2 = tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2
+        text_encoding_strategy = strategy_sdxl.SdxlTextEncodingStrategy()
+        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
 
     unet.to(accelerator.device)  # reduce main memory usage
 
@@ -223,15 +240,22 @@ def train(args):
     # TextEncoderの出力をキャッシュする
     if args.cache_text_encoder_outputs:
         # Text Encodes are eval and no grad
-        text_encoder_output_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-            args.cache_text_encoder_outputs_to_disk, None, False
-        )
+        if args.llm_text_encoder:
+            text_encoder_output_caching_strategy = strategy_sdxl.LlmTextEncoderOutputsCachingStrategy(
+                args.cache_text_encoder_outputs_to_disk, None, False
+            )
+        else:
+            text_encoder_output_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
+                args.cache_text_encoder_outputs_to_disk, None, False
+            )
         strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_output_caching_strategy)
 
         text_encoder1.to(accelerator.device)
-        text_encoder2.to(accelerator.device)
+        if text_encoder2 is not None:
+            text_encoder2.to(accelerator.device)
         with accelerator.autocast():
-            train_dataset_group.new_cache_text_encoder_outputs([text_encoder1, text_encoder2], accelerator)
+            text_encoders = [text_encoder1] if text_encoder2 is None else [text_encoder1, text_encoder2]
+            train_dataset_group.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
         accelerator.wait_for_everyone()
 
@@ -338,7 +362,8 @@ def train(args):
 
     unet.requires_grad_(False)
     text_encoder1.requires_grad_(False)
-    text_encoder2.requires_grad_(False)
+    if text_encoder2 is not None:
+        text_encoder2.requires_grad_(False)
     unet.to(accelerator.device, dtype=weight_dtype)
 
     unet.eval()
@@ -348,12 +373,14 @@ def train(args):
     if args.cache_text_encoder_outputs:
         # move Text Encoders for sampling images. Text Encoder doesn't work on CPU with fp16
         text_encoder1.to("cpu", dtype=torch.float32)
-        text_encoder2.to("cpu", dtype=torch.float32)
+        if text_encoder2 is not None:
+            text_encoder2.to("cpu", dtype=torch.float32)
         clean_memory_on_device(accelerator.device)
     else:
         # make sure Text Encoders are on GPU
         text_encoder1.to(accelerator.device)
-        text_encoder2.to(accelerator.device)
+        if text_encoder2 is not None:
+            text_encoder2.to(accelerator.device)
 
     if not cache_latents:
         vae.requires_grad_(False)
@@ -445,6 +472,7 @@ def train(args):
             os.remove(old_ckpt_file)
 
     # For --sample_at_first
+    text_encoders = [text_encoder1] if text_encoder2 is None else [text_encoder1, text_encoder2, unwrap_model(text_encoder2)]
     sdxl_train_util.sample_images(
         accelerator,
         args,
@@ -453,7 +481,7 @@ def train(args):
         accelerator.device,
         vae,
         [tokenizer1, tokenizer2],
-        [text_encoder1, text_encoder2, unwrap_model(text_encoder2)],
+        text_encoders,
         unet,
         controlnet=control_net,
     )
@@ -493,8 +521,9 @@ def train(args):
                     with torch.no_grad():
                         input_ids1 = input_ids1.to(accelerator.device)
                         input_ids2 = input_ids2.to(accelerator.device)
+                        text_encoders = [text_encoder1] if text_encoder2 is None else [text_encoder1, text_encoder2, unwrap_model(text_encoder2)]
                         encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
-                            tokenize_strategy, [text_encoder1, text_encoder2, unwrap_model(text_encoder2)], [input_ids1, input_ids2]
+                            tokenize_strategy, text_encoders, [input_ids1, input_ids2]
                         )
                         if args.full_fp16:
                             encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
@@ -568,6 +597,7 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                text_encoders = [text_encoder1] if text_encoder2 is None else [text_encoder1, text_encoder2, unwrap_model(text_encoder2)]
                 sdxl_train_util.sample_images(
                     accelerator,
                     args,
@@ -576,7 +606,7 @@ def train(args):
                     accelerator.device,
                     vae,
                     [tokenizer1, tokenizer2],
-                    [text_encoder1, text_encoder2, unwrap_model(text_encoder2)],
+                    text_encoders,
                     unet,
                     controlnet=control_net,
                 )
@@ -630,6 +660,7 @@ def train(args):
                 if args.save_state:
                     train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
+        text_encoders = [text_encoder1] if text_encoder2 is None else [text_encoder1, text_encoder2, unwrap_model(text_encoder2)]
         sdxl_train_util.sample_images(
             accelerator,
             args,
@@ -638,7 +669,7 @@ def train(args):
             accelerator.device,
             vae,
             [tokenizer1, tokenizer2],
-            [text_encoder1, text_encoder2, unwrap_model(text_encoder2)],
+            text_encoders,
             unet,
             controlnet=control_net,
         )

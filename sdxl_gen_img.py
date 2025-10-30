@@ -480,35 +480,91 @@ class PipelineLike:
         tes_real_uncond_embs = []
 
         for tokenizer, text_encoder in zip(self.tokenizers, self.text_encoders):
-            token_replacer = self.get_token_replacer(tokenizer)
+            # Check if this is LLM mode (tokenizer is not CLIPTokenizer)
+            if hasattr(tokenizer, 'bos_token_id'):  # CLIP tokenizer
+                token_replacer = self.get_token_replacer(tokenizer)
 
-            # use last text_pool, because it is from text encoder 2
-            text_embeddings, text_pool, uncond_embeddings, uncond_pool, _ = get_weighted_text_embeddings(
-                tokenizer,
-                text_encoder,
-                prompt=prompt,
-                uncond_prompt=negative_prompt if do_classifier_free_guidance else None,
-                max_embeddings_multiples=max_embeddings_multiples,
-                clip_skip=self.clip_skip,
-                token_replacer=token_replacer,
-                device=self.device,
-                **kwargs,
-            )
-            tes_text_embs.append(text_embeddings)
-            tes_uncond_embs.append(uncond_embeddings)
-
-            if negative_scale is not None:
-                _, real_uncond_embeddings, _ = get_weighted_text_embeddings(
-                    token_replacer,
-                    prompt=prompt,  # こちらのトークン長に合わせてuncondを作るので75トークン超で必須
-                    uncond_prompt=[""] * batch_size,
+                # use last text_pool, because it is from text encoder 2
+                text_embeddings, text_pool, uncond_embeddings, uncond_pool, _ = get_weighted_text_embeddings(
+                    tokenizer,
+                    text_encoder,
+                    prompt=prompt,
+                    uncond_prompt=negative_prompt if do_classifier_free_guidance else None,
                     max_embeddings_multiples=max_embeddings_multiples,
                     clip_skip=self.clip_skip,
                     token_replacer=token_replacer,
                     device=self.device,
                     **kwargs,
                 )
-                tes_real_uncond_embs.append(real_uncond_embeddings)
+                tes_text_embs.append(text_embeddings)
+                tes_uncond_embs.append(uncond_embeddings)
+
+                if negative_scale is not None:
+                    _, real_uncond_embeddings, _ = get_weighted_text_embeddings(
+                        token_replacer,
+                        prompt=prompt,  # こちらのトークン長に合わせてuncondを作るので75トークン超で必須
+                        uncond_prompt=[""] * batch_size,
+                        max_embeddings_multiples=max_embeddings_multiples,
+                        clip_skip=self.clip_skip,
+                        token_replacer=token_replacer,
+                        device=self.device,
+                        **kwargs,
+                    )
+                    tes_real_uncond_embs.append(real_uncond_embeddings)
+            else:  # LLM mode
+                from library.strategy_sdxl import LlmTextEncodingStrategy
+                llm_strategy = LlmTextEncodingStrategy(
+                    system_prompt=getattr(args, 'llm_system_prompt', ''),
+                    text_encoder=text_encoder  # Pass text_encoder for auto-projection
+                )
+
+                # Process prompt
+                combined_prompt = prompt if isinstance(prompt, str) else prompt[0]
+                tokens = tokenizer(combined_prompt, return_tensors="pt", padding="max_length", truncation=True, max_length=256)
+                tokens = {k: v.to(self.device) for k, v in tokens.items()}
+
+                with torch.no_grad():
+                    encoded_results = llm_strategy.encode_tokens(
+                        None, [text_encoder, tokenizer], [tokens['input_ids']]
+                    )
+                    encoder_hidden_states1, encoder_hidden_states2, pool2 = encoded_results
+
+                # Concatenate for cross-attention (768 + 1280 = 2048)
+                text_embeddings = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2)
+                text_pool = pool2
+
+                tes_text_embs.append(text_embeddings)
+
+                # Process negative prompt if needed
+                if do_classifier_free_guidance:
+                    combined_neg_prompt = negative_prompt if isinstance(negative_prompt, str) else negative_prompt[0]
+                    neg_tokens = tokenizer(combined_neg_prompt, return_tensors="pt", padding="max_length", truncation=True, max_length=256)
+                    neg_tokens = {k: v.to(self.device) for k, v in neg_tokens.items()}
+
+                    with torch.no_grad():
+                        neg_encoded_results = llm_strategy.encode_tokens(
+                            None, [text_encoder, tokenizer], [neg_tokens['input_ids']]
+                        )
+                        neg_encoder_hidden_states1, neg_encoder_hidden_states2, neg_pool2 = neg_encoded_results
+
+                    uncond_embeddings = torch.cat([neg_encoder_hidden_states1, neg_encoder_hidden_states2], dim=2)
+                    tes_uncond_embs.append(uncond_embeddings)
+                else:
+                    tes_uncond_embs.append(None)
+                
+                if negative_scale is not None:
+                    # For negative scale, use empty prompt
+                    empty_tokens = tokenizer("", return_tensors="pt", padding="max_length", truncation=True, max_length=256)
+                    empty_tokens = {k: v.to(self.device) for k, v in empty_tokens.items()}
+
+                    with torch.no_grad():
+                        empty_encoded_results = llm_strategy.encode_tokens(
+                            None, [text_encoder, tokenizer], [empty_tokens['input_ids']]
+                        )
+                        empty_encoder_hidden_states1, empty_encoder_hidden_states2, empty_pool2 = empty_encoded_results
+
+                    real_uncond_embeddings = torch.cat([empty_encoder_hidden_states1, empty_encoder_hidden_states2], dim=2)
+                    tes_real_uncond_embs.append(real_uncond_embeddings)
 
         # concat text encoder outputs
         text_embeddings = tes_text_embs[0]
@@ -1490,9 +1546,22 @@ def main(args):
         if len(files) == 1:
             args.ckpt = files[0]
 
-    (_, text_encoder1, text_encoder2, vae, unet, _, _) = sdxl_train_util._load_target_model(
-        args.ckpt, args.vae, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, dtype
-    )
+    if args.llm_text_encoder:
+        # Load SDXL with LLM text encoder
+        (_, text_encoder, tokenizer, vae, unet, _, _) = sdxl_train_util._load_target_model_with_llm(
+            args.ckpt, args.vae, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.llm_text_encoder, dtype
+        )
+        text_encoder1 = None
+        text_encoder2 = None
+        use_llm = True
+    else:
+        # Load standard SDXL with CLIP text encoders
+        (_, text_encoder1, text_encoder2, vae, unet, _, _) = sdxl_train_util._load_target_model(
+            args.ckpt, args.vae, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, dtype
+        )
+        text_encoder = None
+        use_llm = False
+        
     unet: InferSdxlUNet2DConditionModel = InferSdxlUNet2DConditionModel(unet)
 
     # xformers、Hypernetwork対応
@@ -1503,7 +1572,10 @@ def main(args):
 
     # tokenizerを読み込む
     logger.info("loading tokenizer")
-    tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
+    if use_llm:
+        tokenizer1, tokenizer2 = None, None  # LLM tokenizer is already loaded above
+    else:
+        tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
 
     # schedulerを用意する
     sched_init_args = {}
@@ -1651,11 +1723,23 @@ def main(args):
     vae.to(vae_dtype).to(device)
     vae.eval()
 
-    text_encoder1.to(dtype).to(device)
-    text_encoder2.to(dtype).to(device)
+    if use_llm:
+        # LLM mode
+        text_encoder.to(dtype).to(device)
+        text_encoder.eval()
+        # Set dummy values for CLIP models (not used in LLM mode)
+        text_encoder1 = None
+        text_encoder2 = None
+        tokenizer1 = None
+        tokenizer2 = None
+    else:
+        # CLIP mode
+        text_encoder1.to(dtype).to(device)
+        text_encoder2.to(dtype).to(device)
+        text_encoder1.eval()
+        text_encoder2.eval()
+
     unet.to(dtype).to(device)
-    text_encoder1.eval()
-    text_encoder2.eval()
     unet.eval()
 
     # networkを組み込む
@@ -1703,7 +1787,7 @@ def main(args):
                     logger.info(f"metadata for: {network_weight}: {metadata}")
 
             network, weights_sd = imported_module.create_network_from_weights(
-                network_mul, network_weight, vae, [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
+                network_mul, network_weight, vae, [text_encoder] if use_llm else [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
             )
             if network is None:
                 return
@@ -1714,7 +1798,7 @@ def main(args):
 
             if not mergeable or i >= network_merge:
                 # not merging
-                network.apply_to([text_encoder1, text_encoder2], unet)
+                network.apply_to([text_encoder] if use_llm else [text_encoder1, text_encoder2], unet)
                 info = network.load_state_dict(weights_sd, False)  # network.load_weightsを使うようにするとよい
                 logger.info(f"weights are loaded: {info}")
 
@@ -1729,7 +1813,7 @@ def main(args):
                 networks.append(network)
                 network_default_muls.append(network_mul)
             else:
-                network.merge_to([text_encoder1, text_encoder2], unet, weights_sd, dtype, device)
+                network.merge_to([text_encoder] if use_llm else [text_encoder1, text_encoder2], unet, weights_sd, dtype, device)
 
     else:
         networks = []
@@ -1795,8 +1879,11 @@ def main(args):
 
     if args.opt_channels_last:
         logger.info(f"set optimizing: channels last")
-        text_encoder1.to(memory_format=torch.channels_last)
-        text_encoder2.to(memory_format=torch.channels_last)
+        if not use_llm:
+            text_encoder1.to(memory_format=torch.channels_last)
+            text_encoder2.to(memory_format=torch.channels_last)
+        else:
+            text_encoder.to(memory_format=torch.channels_last)
         vae.to(memory_format=torch.channels_last)
         unet.to(memory_format=torch.channels_last)
         if networks:
@@ -1811,8 +1898,8 @@ def main(args):
     pipe = PipelineLike(
         device,
         vae,
-        [text_encoder1, text_encoder2],
-        [tokenizer1, tokenizer2],
+        [text_encoder] if use_llm else [text_encoder1, text_encoder2],
+        [tokenizer] if use_llm else [tokenizer1, tokenizer2],
         unet,
         scheduler,
         args.clip_skip,
@@ -3039,6 +3126,18 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--clip_skip", type=int, default=None, help="layer number from bottom to use in CLIP / CLIPの後ろからn層目の出力を使う"
+    )
+    parser.add_argument(
+        "--llm_text_encoder",
+        type=str,
+        default=None,
+        help="Use LLM as text encoder instead of CLIP (path to LLM model folder) / CLIPの代わりにLLMをtext encoderとして使用 (LLMモデルのフォルダパス)",
+    )
+    parser.add_argument(
+        "--llm_system_prompt",
+        type=str,
+        default="",
+        help="System prompt for LLM text encoder / LLM text encoderのシステムプロンプト",
     )
     parser.add_argument(
         "--max_embeddings_multiples",

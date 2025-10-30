@@ -3,7 +3,7 @@ import safetensors
 from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from safetensors.torch import load_file, save_file
-from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer, AutoTokenizer, AutoModel
 from typing import List
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
@@ -488,6 +488,7 @@ def save_stable_diffusion_checkpoint(
     logit_scale,
     metadata,
     save_dtype=None,
+    save_unet_only=False,
 ):
     state_dict = {}
 
@@ -501,15 +502,16 @@ def save_stable_diffusion_checkpoint(
     # Convert the UNet model
     update_sd("model.diffusion_model.", unet.state_dict())
 
-    # Convert the text encoders
-    update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
+    if not save_unet_only:
+        # Convert the text encoders
+        update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
 
-    text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
-    update_sd("conditioner.embedders.1.model.", text_enc2_dict)
+        text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
+        update_sd("conditioner.embedders.1.model.", text_enc2_dict)
 
-    # Convert the VAE
-    vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
-    update_sd("first_stage_model.", vae_dict)
+        # Convert the VAE
+        vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
+        update_sd("first_stage_model.", vae_dict)
 
     # Put together new checkpoint
     key_count = len(state_dict.keys())
@@ -532,7 +534,7 @@ def save_stable_diffusion_checkpoint(
 
 
 def save_diffusers_checkpoint(
-    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None
+    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None, save_unet_only=False
 ):
     from diffusers import StableDiffusionXLPipeline
 
@@ -569,6 +571,13 @@ def save_diffusers_checkpoint(
     remove_name_or_path(tokenizer2)
     remove_name_or_path(vae)
 
+    if save_unet_only:
+        # Save only UNet
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        diffusers_unet.save_pretrained(output_dir, safe_serialization=use_safetensors)
+        return
+
     pipeline = StableDiffusionXLPipeline(
         unet=diffusers_unet,
         text_encoder=text_encoder1,
@@ -581,3 +590,120 @@ def save_diffusers_checkpoint(
     if save_dtype is not None:
         pipeline.to(None, save_dtype)
     pipeline.save_pretrained(output_dir, safe_serialization=use_safetensors)
+
+
+def load_llm_model(llm_model_path, device="cpu", dtype=None, target_hidden_size=2048):
+    """
+    Load LLM model for text encoding, replacing CLIP text encoders
+    """
+    logger.info(f"Loading LLM from {llm_model_path}...")
+    
+    tokenizer = AutoTokenizer.from_pretrained(llm_model_path)
+    tokenizer.padding_side = "right"
+    
+    text_encoder = AutoModel.from_pretrained(
+        llm_model_path,
+        torch_dtype=dtype if dtype else torch.float32,
+    )
+    
+    # Get LLM hidden size
+    if hasattr(text_encoder.config, 'hidden_size'):
+        llm_hidden_size = text_encoder.config.hidden_size
+    else:
+        llm_hidden_size = 1024  # default fallback
+    
+    # Create projection layer if needed
+    projection = None
+    if llm_hidden_size != target_hidden_size:
+        logger.info(f"LLM hidden size ({llm_hidden_size}) != target size ({target_hidden_size}), creating projection layer")
+        projection = torch.nn.Linear(llm_hidden_size, target_hidden_size, bias=False)
+        
+        with torch.no_grad():
+            if llm_hidden_size < target_hidden_size:
+                # Copy weights for smaller dimensions
+                projection.weight[:llm_hidden_size, :] = torch.eye(llm_hidden_size)
+            else:
+                # Use orthogonal initialization for larger dimensions
+                if dtype == torch.bfloat16:
+                    orig_dtype = projection.weight.dtype
+                    projection.weight.data = projection.weight.data.to(torch.float32)
+                    torch.nn.init.orthogonal_(projection.weight)
+                    projection.weight.data = projection.weight.data.to(orig_dtype)
+                else:
+                    torch.nn.init.orthogonal_(projection.weight)
+        
+        projection = projection.to(device)
+        if dtype:
+            projection = projection.to(dtype)
+    
+    text_encoder.eval()
+    text_encoder.requires_grad_(False)
+    
+    if device != "auto" and device != "cpu":
+        text_encoder = text_encoder.to(device)
+    
+    if dtype and device != "auto":
+        text_encoder = text_encoder.to(dtype)
+    
+    return tokenizer, text_encoder, projection
+
+
+def load_models_from_sdxl_checkpoint_with_llm(model_version, ckpt_path, llm_model_path, map_location, dtype=None, disable_mmap=False):
+    """
+    Load SDXL models with LLM text encoder instead of dual CLIP
+    """
+    # Load the state dict (same as original function)
+    if model_util.is_safetensors(ckpt_path):
+        checkpoint = None
+        if disable_mmap:
+            state_dict = safetensors.torch.load(open(ckpt_path, "rb").read())
+        else:
+            try:
+                state_dict = load_file(ckpt_path, device=map_location)
+            except:
+                state_dict = load_file(ckpt_path)  # prevent device invalid Error
+        epoch = None
+        global_step = None
+    else:
+        checkpoint = torch.load(ckpt_path, map_location=map_location)
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+            epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("global_step", 0)
+        else:
+            state_dict = checkpoint
+            epoch = 0
+            global_step = 0
+        checkpoint = None
+
+    # U-Net (same as original)
+    logger.info("building U-Net")
+    with init_empty_weights():
+        unet = sdxl_original_unet.SdxlUNet2DConditionModel()
+
+    logger.info("loading U-Net from checkpoint")
+    unet_sd = {}
+    for k in list(state_dict.keys()):
+        if k.startswith("model.diffusion_model."):
+            unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+    info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
+    logger.info(f"U-Net: {info}")
+
+    # Load LLM instead of CLIP text encoders
+    logger.info("loading LLM text encoder")
+    tokenizer, text_encoder, projection = load_llm_model(llm_model_path, device=map_location, dtype=dtype)
+
+    # VAE (same as original)
+    logger.info("building VAE")
+    vae_config = model_util.create_vae_diffusers_config()
+    with init_empty_weights():
+        vae = AutoencoderKL(**vae_config)
+
+    logger.info("loading VAE from checkpoint")
+    converted_vae_checkpoint = model_util.convert_ldm_vae_checkpoint(state_dict, vae_config)
+    info = _load_state_dict_on_device(vae, converted_vae_checkpoint, device=map_location, dtype=dtype)
+    logger.info(f"VAE: {info}")
+
+    ckpt_info = (epoch, global_step) if epoch is not None else None
+    # Return single text_encoder and tokenizer instead of two
+    return text_encoder, tokenizer, vae, unet, ckpt_info

@@ -53,24 +53,47 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             unet,
             logit_scale,
             ckpt_info,
+            llm_tokenizer,
+            llm_projection,
         ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
 
         self.load_stable_diffusion_format = load_stable_diffusion_format
         self.logit_scale = logit_scale
         self.ckpt_info = ckpt_info
+        self.llm_tokenizer = llm_tokenizer
+        self.llm_projection = llm_projection
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
-        return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
+        if args.llm_text_encoder:
+            return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1], vae, unet
+        else:
+            return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
 
     def get_tokenize_strategy(self, args):
-        return strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
+        if args.llm_text_encoder:
+            return strategy_sdxl.LlmTokenizeStrategy(self.llm_tokenizer, args.max_token_length)
+        else:
+            return strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
 
-    def get_tokenizers(self, tokenize_strategy: strategy_sdxl.SdxlTokenizeStrategy):
-        return [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]
+    def get_tokenizers(self, tokenize_strategy):
+        if hasattr(tokenize_strategy, 'tokenizer1'):
+            return [tokenize_strategy.tokenizer1, tokenize_strategy.tokenizer2]
+        else:
+            return [tokenize_strategy.tokenizer]
+
+    def get_text_encoding_strategy(self, args):
+        if args.llm_text_encoder:
+            return strategy_sdxl.LlmTextEncodingStrategy(
+                projection=self.llm_projection,
+                system_prompt=args.llm_system_prompt,
+                text_encoder=self.text_encoder1  # Pass text_encoder for auto-projection
+            )
+        else:
+            return strategy_sdxl.SdxlTextEncodingStrategy()
 
     def get_latents_caching_strategy(self, args):
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
@@ -86,9 +109,14 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
-            return strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
-            )
+            if args.llm_text_encoder:
+                return strategy_sdxl.LlmTextEncoderOutputsCachingStrategy(
+                    args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
+                )
+            else:
+                return strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
+                    args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
+                )
         else:
             return None
 
@@ -214,7 +242,12 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         return noise_pred
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
-        sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
+        if args.llm_text_encoder:
+            # For LLM, pass single tokenizer and text_encoder
+            sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
+        else:
+            # Original dual CLIP
+            sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
 
 def setup_parser() -> argparse.ArgumentParser:

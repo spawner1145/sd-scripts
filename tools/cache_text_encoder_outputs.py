@@ -157,9 +157,15 @@ def cache_to_disk(args: argparse.Namespace) -> None:
 
     # build text encoder outputs caching strategy
     if is_sdxl:
-        text_encoder_outputs_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-            args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
-        )
+        # Check if LLM mode is enabled (this would need to be added to the script arguments)
+        if hasattr(args, 'llm_text_encoder') and args.llm_text_encoder:
+            text_encoder_outputs_caching_strategy = strategy_sdxl.LlmTextEncoderOutputsCachingStrategy(
+                args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
+            )
+        else:
+            text_encoder_outputs_caching_strategy = strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
+                args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
+            )
     else:
         text_encoder_outputs_caching_strategy = strategy_flux.FluxTextEncoderOutputsCachingStrategy(
             args.cache_text_encoder_outputs_to_disk,

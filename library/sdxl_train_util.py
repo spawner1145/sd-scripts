@@ -31,23 +31,67 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
         if pi == accelerator.state.local_process_index:
             logger.info(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
 
-            (
-                load_stable_diffusion_format,
-                text_encoder1,
-                text_encoder2,
-                vae,
-                unet,
-                logit_scale,
-                ckpt_info,
-            ) = _load_target_model(
-                args.pretrained_model_name_or_path,
-                args.vae,
-                model_version,
-                weight_dtype,
-                accelerator.device if args.lowram else "cpu",
-                model_dtype,
-                args.disable_mmap_load_safetensors,
-            )
+            if getattr(args, 'from_scratch', False):
+                # Train from scratch - create random initialized models
+                logger.info("training from scratch - creating random initialized models")
+                (
+                    load_stable_diffusion_format,
+                    text_encoder1,
+                    text_encoder2,
+                    vae,
+                    unet,
+                    logit_scale,
+                    ckpt_info,
+                    llm_tokenizer,
+                    llm_projection,
+                ) = _create_models_from_scratch(args, model_version, weight_dtype, accelerator.device if args.lowram else "cpu", model_dtype)
+            elif args.llm_text_encoder:
+                # Use LLM instead of dual CLIP
+                (
+                    load_stable_diffusion_format,
+                    text_encoder,
+                    tokenizer,
+                    vae,
+                    unet,
+                    ckpt_info,
+                    projection,
+                ) = _load_target_model_with_llm(
+                    args.pretrained_model_name_or_path,
+                    args.llm_text_encoder,
+                    args.vae,
+                    model_version,
+                    weight_dtype,
+                    accelerator.device if args.lowram else "cpu",
+                    model_dtype,
+                    args.disable_mmap_load_safetensors,
+                    getattr(args, 'unet_path', None),
+                )
+                text_encoder1, text_encoder2 = text_encoder, None  # For compatibility
+                logit_scale = None
+                # Store LLM tokenizer and projection for later use
+                llm_tokenizer = tokenizer
+                llm_projection = projection
+            else:
+                # Original dual CLIP loading
+                (
+                    load_stable_diffusion_format,
+                    text_encoder1,
+                    text_encoder2,
+                    vae,
+                    unet,
+                    logit_scale,
+                    ckpt_info,
+                ) = _load_target_model(
+                    args.pretrained_model_name_or_path,
+                    args.vae,
+                    model_version,
+                    weight_dtype,
+                    accelerator.device if args.lowram else "cpu",
+                    model_dtype,
+                    args.disable_mmap_load_safetensors,
+                )
+                llm_tokenizer = None
+                llm_projection = None
 
             # work on low-ram device
             if args.lowram:
@@ -59,7 +103,7 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
             clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
 
-    return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
+    return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info, llm_tokenizer, llm_projection
 
 
 def _load_target_model(
@@ -133,35 +177,124 @@ def _load_target_model(
     return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
 
 
+def _load_target_model_with_llm(
+    name_or_path: str, llm_model_path: str, vae_path: Optional[str], model_version: str, weight_dtype, device="cpu", model_dtype=None, disable_mmap=False, unet_path=None
+):
+    # Load SDXL with LLM text encoder instead of dual CLIP
+    name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
+    load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
+
+    # Use the LLM model path directly
+    actual_llm_path = llm_model_path
+    
+    if load_stable_diffusion_format:
+        logger.info(f"load StableDiffusion checkpoint: {name_or_path} with LLM text encoder")
+        (
+            text_encoder,
+            tokenizer,
+            vae,
+            unet,
+            ckpt_info,
+        ) = sdxl_model_util.load_models_from_sdxl_checkpoint_with_llm(model_version, name_or_path, actual_llm_path, device, model_dtype, disable_mmap)
+    else:
+        # For Diffusers models, we still need to load the base model but replace text encoders with LLM
+        from diffusers import StableDiffusionXLPipeline
+
+        variant = "fp16" if weight_dtype == torch.float16 else None
+        logger.info(f"load Diffusers pretrained models: {name_or_path}, variant={variant}, replacing text encoders with LLM")
+        try:
+            try:
+                pipe = StableDiffusionXLPipeline.from_pretrained(
+                    name_or_path, torch_dtype=model_dtype, variant=variant, tokenizer=None
+                )
+            except EnvironmentError as ex:
+                if variant is not None:
+                    logger.info("try to load fp32 model")
+                    pipe = StableDiffusionXLPipeline.from_pretrained(name_or_path, variant=None, tokenizer=None)
+                else:
+                    raise ex
+        except EnvironmentError as ex:
+            logger.error(
+                f"model is not found as a file or in Hugging Face, perhaps file name is wrong? / 指定したモデル名のファイル、またはHugging Faceのモデルが見つかりません。ファイル名が誤っているかもしれません: {name_or_path}"
+            )
+            raise ex
+
+        # Load LLM instead of CLIP text encoders
+        tokenizer, text_encoder, projection = sdxl_model_util.load_llm_model(actual_llm_path, device=device, dtype=model_dtype)
+
+        vae = pipe.vae
+        unet = pipe.unet
+        del pipe
+
+        # Convert Diffusers U-Net to original U-Net
+        state_dict = sdxl_model_util.convert_diffusers_unet_state_dict_to_sdxl(unet.state_dict())
+        with init_empty_weights():
+            unet = sdxl_original_unet.SdxlUNet2DConditionModel()  # overwrite unet
+        sdxl_model_util._load_state_dict_on_device(unet, state_dict, device=device, dtype=model_dtype)
+        logger.info("U-Net converted to original U-Net")
+
+        ckpt_info = None
+
+    # Load additional VAE if specified
+    if vae_path is not None:
+        vae = model_util.load_vae(vae_path, weight_dtype)
+        logger.info("additional VAE loaded")
+
+    # Load U-Net from separate path if specified
+    if unet_path is not None:
+        logger.info(f"loading U-Net from: {unet_path}")
+        unet_state_dict = model_util.load_state_dict(unet_path, map_location="cpu")
+        # Convert to SDXL U-Net format if needed
+        if "model.diffusion_model." in list(unet_state_dict.keys())[0]:
+            # Already in SDXL format
+            pass
+        else:
+            # Assume it's in Diffusers format, convert to SDXL
+            unet_state_dict = sdxl_model_util.convert_diffusers_unet_state_dict_to_sdxl(unet_state_dict)
+        
+        with init_empty_weights():
+            unet = sdxl_original_unet.SdxlUNet2DConditionModel()
+        sdxl_model_util._load_state_dict_on_device(unet, unet_state_dict, device=device, dtype=model_dtype)
+        logger.info("U-Net loaded from separate path")
+
+    return load_stable_diffusion_format, text_encoder, tokenizer, vae, unet, ckpt_info
+
+
 def load_tokenizers(args: argparse.Namespace):
     logger.info("prepare tokenizers")
 
-    original_paths = [TOKENIZER1_PATH, TOKENIZER2_PATH]
-    tokeniers = []
-    for i, original_path in enumerate(original_paths):
-        tokenizer: CLIPTokenizer = None
-        if args.tokenizer_cache_dir:
-            local_tokenizer_path = os.path.join(args.tokenizer_cache_dir, original_path.replace("/", "_"))
-            if os.path.exists(local_tokenizer_path):
-                logger.info(f"load tokenizer from cache: {local_tokenizer_path}")
-                tokenizer = CLIPTokenizer.from_pretrained(local_tokenizer_path)
+    if args.llm_text_encoder:
+        # For LLM, tokenizer is already loaded in _load_target_model_with_llm
+        # Return None for now, will be handled differently
+        return None
+    else:
+        # Original dual CLIP tokenizers
+        original_paths = [TOKENIZER1_PATH, TOKENIZER2_PATH]
+        tokeniers = []
+        for i, original_path in enumerate(original_paths):
+            tokenizer: CLIPTokenizer = None
+            if args.tokenizer_cache_dir:
+                local_tokenizer_path = os.path.join(args.tokenizer_cache_dir, original_path.replace("/", "_"))
+                if os.path.exists(local_tokenizer_path):
+                    logger.info(f"load tokenizer from cache: {local_tokenizer_path}")
+                    tokenizer = CLIPTokenizer.from_pretrained(local_tokenizer_path)
 
-        if tokenizer is None:
-            tokenizer = CLIPTokenizer.from_pretrained(original_path)
+            if tokenizer is None:
+                tokenizer = CLIPTokenizer.from_pretrained(original_path)
 
-        if args.tokenizer_cache_dir and not os.path.exists(local_tokenizer_path):
-            logger.info(f"save Tokenizer to cache: {local_tokenizer_path}")
-            tokenizer.save_pretrained(local_tokenizer_path)
+            if args.tokenizer_cache_dir and not os.path.exists(local_tokenizer_path):
+                logger.info(f"save Tokenizer to cache: {local_tokenizer_path}")
+                tokenizer.save_pretrained(local_tokenizer_path)
 
-        if i == 1:
-            tokenizer.pad_token_id = 0  # fix pad token id to make same as open clip tokenizer
+            if i == 1:
+                tokenizer.pad_token_id = 0  # fix pad token id to make same as open clip tokenizer
 
-        tokeniers.append(tokenizer)
+            tokeniers.append(tokenizer)
 
-    if hasattr(args, "max_token_length") and args.max_token_length is not None:
-        logger.info(f"update token length: {args.max_token_length}")
+        if hasattr(args, "max_token_length") and args.max_token_length is not None:
+            logger.info(f"update token length: {args.max_token_length}")
 
-    return tokeniers
+        return tokeniers
 
 
 def match_mixed_precision(args, weight_dtype):
@@ -230,6 +363,7 @@ def save_sd_model_on_train_end(
     vae,
     logit_scale,
     ckpt_info,
+    save_unet_only=False,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
@@ -245,6 +379,7 @@ def save_sd_model_on_train_end(
             logit_scale,
             sai_metadata,
             save_dtype,
+            save_unet_only=save_unet_only,
         )
 
     def diffusers_saver(out_dir):
@@ -257,6 +392,7 @@ def save_sd_model_on_train_end(
             vae,
             use_safetensors=use_safetensors,
             save_dtype=save_dtype,
+            save_unet_only=save_unet_only,
         )
 
     train_util.save_sd_model_on_train_end_common(
@@ -283,6 +419,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
     vae,
     logit_scale,
     ckpt_info,
+    save_unet_only=False,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
@@ -298,6 +435,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
             logit_scale,
             sai_metadata,
             save_dtype,
+            save_unet_only=save_unet_only,
         )
 
     def diffusers_saver(out_dir):
@@ -310,6 +448,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
             vae,
             use_safetensors=use_safetensors,
             save_dtype=save_dtype,
+            save_unet_only=save_unet_only,
         )
 
     train_util.save_sd_model_on_epoch_end_or_stepwise_common(
@@ -338,6 +477,34 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser, support_text_en
             action="store_true",
             help="cache text encoder outputs to disk / text encoderの出力をディスクにキャッシュする",
         )
+    parser.add_argument(
+        "--llm_text_encoder",
+        type=str,
+        default=None,
+        help="use LLM as text encoder instead of CLIP (path to LLM model folder) / CLIPの代わりにLLMをtext encoderとして使用 (LLMモデルのフォルダパス)",
+    )
+    parser.add_argument(
+        "--llm_system_prompt",
+        type=str,
+        default="",
+        help="system prompt for LLM text encoder / LLM text encoderのシステムプロンプト",
+    )
+    parser.add_argument(
+        "--save_unet_only",
+        action="store_true",
+        help="save only U-Net (useful for LLM mode where CLIP is not needed) / U-Netのみ保存 (LLMモードでCLIPが不要な場合に有用)",
+    )
+    parser.add_argument(
+        "--unet_path",
+        type=str,
+        default=None,
+        help="path to U-Net model (for loading U-Net separately) / U-Netモデルのパス (U-Netを個別にロードする場合)",
+    )
+    parser.add_argument(
+        "--from_scratch",
+        action="store_true",
+        help="train from scratch (random initialization) instead of fine-tuning / スクラッチから訓練 (ランダム初期化) ではなくファインチューニング",
+    )
     parser.add_argument(
         "--disable_mmap_load_safetensors",
         action="store_true",
@@ -377,7 +544,74 @@ def verify_sdxl_training_args(args: argparse.Namespace, support_text_encoder_cac
             )
 
 
-def sample_images(*args, **kwargs):
-    from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
+def sample_images(accelerator, args, epoch, steps, device, vae, tokenizer, text_encoder, unet, **kwargs):
+    # Skip sampling in LLM mode as the pipeline doesn't support LLM tokenizer
+    if args.llm_text_encoder:
+        logger.info("Skipping sample generation in LLM mode (not supported yet)")
+        return
 
-    return train_util.sample_images_common(SdxlStableDiffusionLongPromptWeightingPipeline, *args, **kwargs)
+    from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
+    return train_util.sample_images_common(SdxlStableDiffusionLongPromptWeightingPipeline, accelerator, args, epoch, steps, device, vae, tokenizer, text_encoder, unet, **kwargs)
+
+
+def _create_models_from_scratch(args, model_version: str, weight_dtype, device="cpu", model_dtype=None):
+    """Create randomly initialized models for training from scratch"""
+    from diffusers import AutoencoderKL
+    from transformers import CLIPTokenizer, CLIPTextModel
+    import library.sdxl_model_util as sdxl_model_util
+    
+    logger.info("creating models from scratch")
+    
+    # Create random initialized U-Net
+    with init_empty_weights():
+        unet = sdxl_original_unet.SdxlUNet2DConditionModel()
+    
+    # Create random initialized text encoders (CLIP)
+    with init_empty_weights():
+        text_encoder1 = CLIPTextModel.from_pretrained(
+            "openai/clip-vit-large-patch14", torch_dtype=model_dtype
+        )
+        text_encoder2 = CLIPTextModel.from_pretrained(
+            "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k", torch_dtype=model_dtype
+        )
+    
+        # Use pretrained VAE as starting point
+        vae = AutoencoderKL.from_pretrained(
+            sdxl_model_util.DIFFUSERS_REF_MODEL_ID_SDXL, subfolder="vae", torch_dtype=model_dtype
+        )
+    
+    # Load tokenizers
+    tokenizer1 = CLIPTokenizer.from_pretrained(sdxl_model_util.DIFFUSERS_REF_MODEL_ID_SDXL, subfolder="tokenizer")
+    tokenizer2 = CLIPTokenizer.from_pretrained(sdxl_model_util.DIFFUSERS_REF_MODEL_ID_SDXL, subfolder="tokenizer_2")
+    
+    # For logit_scale, use a reasonable default
+    logit_scale = torch.tensor(2.0)
+    
+    # No checkpoint info for from-scratch training
+    ckpt_info = None
+    
+    # For LLM mode, we need LLM components
+    if args.llm_text_encoder:
+        llm_path = args.llm_text_encoder
+        tokenizer, text_encoder, projection = sdxl_model_util.load_llm_model(llm_path, device=device, dtype=model_dtype)
+        text_encoder1, text_encoder2 = text_encoder, None
+        logit_scale = None
+        llm_tokenizer = tokenizer
+        llm_projection = projection
+    else:
+        llm_tokenizer = None
+        llm_projection = None
+    
+    load_stable_diffusion_format = False  # Not loading from SD format
+    
+    return (
+        load_stable_diffusion_format,
+        text_encoder1,
+        text_encoder2,
+        vae,
+        unet,
+        logit_scale,
+        ckpt_info,
+        llm_tokenizer,
+        llm_projection,
+    )
