@@ -82,15 +82,16 @@ class LSNetToClipAdapter(nn.Module):
         self,
         lsnet_emb: torch.Tensor,
         text_embeddings: torch.Tensor,
-        insert_position: int = 0  # 0: prepend, -1: append
+        insert_position: int = 1  # Changed default to 1 (after BOS)
     ) -> torch.Tensor:
         """
         Generate extra tokens from LSNet embedding and concatenate to text_embeddings.
+        Follows SDXL's long token concatenation logic.
 
         Args:
             lsnet_emb: (batch, lsnet_feature_dim)
             text_embeddings: (batch, seq_len, clip_hidden_dim)
-            insert_position: where to insert tokens (0 for prepend, -1 for append)
+            insert_position: where to insert tokens (1 for after BOS, 0 for before BOS, -1 for append)
 
         Returns:
             new_text_embeddings: (batch, seq_len + num_extra_tokens, clip_hidden_dim)
@@ -104,16 +105,11 @@ class LSNetToClipAdapter(nn.Module):
         tokens = self.tokens_ln(tokens)
         tokens = self.tokens_dropout(tokens)
 
-        # Insert tokens
-        if insert_position == 0:
-            return torch.cat([tokens, text_embeddings], dim=1)
-        elif insert_position == -1:
-            return torch.cat([text_embeddings, tokens], dim=1)
-        else:
-            # Insert at specific position
-            before = text_embeddings[:, :insert_position]
-            after = text_embeddings[:, insert_position:]
-            return torch.cat([before, tokens, after], dim=1)
+        # Use the new helper function for proper concatenation
+        extended_embeddings, _ = extend_text_embeddings_sdxl_style(
+            text_embeddings, tokens, torch.zeros(text_embeddings.shape[0], 1280), insert_position
+        )
+        return extended_embeddings
 
     def forward(
         self,
@@ -122,16 +118,18 @@ class LSNetToClipAdapter(nn.Module):
         text_pool: Optional[torch.Tensor] = None,
         alpha: float = 0.5,
         pooled_mode: str = "add",
-        token_insert_position: int = 0
+        token_insert_position: int = 1  # Changed default to 1
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Full forward pass, optionally fusing both pooled and tokens.
+        Follows SDXL's long token concatenation logic for pool handling.
 
         Returns:
             (new_text_embeddings, new_text_pool)
         """
-        new_text_pool = None
-        if text_pool is not None:
+        new_text_pool = text_pool  # Keep original pool unchanged (SDXL style)
+        # Optional: light fusion if requested
+        if text_pool is not None and pooled_mode != "keep":
             new_text_pool = self.forward_pooled(lsnet_emb, text_pool, alpha, pooled_mode)
 
         new_text_embeddings = None
@@ -167,28 +165,64 @@ def save_lsnet_embedding_to_npz(emb: torch.Tensor, npz_path: str):
     np.savez(npz_path, lsnet_emb=emb.cpu().numpy())
 
 
-# Example usage
-if __name__ == "__main__":
-    # Example dimensions
-    adapter = LSNetToClipAdapter(
-        lsnet_feature_dim=384,
-        clip_hidden_dim=2048,
-        clip_pooled_dim=1280,
-        num_extra_tokens=4,  # Generate 4 extra tokens
-    )
+def extend_text_embeddings_sdxl_style(
+    text_embeddings: torch.Tensor,  # (batch, seq_len, hidden_dim) - typically 77 tokens
+    extra_tokens: torch.Tensor,     # (batch, num_extra, hidden_dim) - LSNet tokens
+    original_pool: torch.Tensor,    # (batch, pool_dim) - original pooled embedding
+    insert_position: int = 1        # 1 = after BOS (recommended)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extend text embeddings with extra tokens, directly following SDXL's get_hidden_states_sdxl logic.
 
-    # Dummy inputs
-    lsnet_emb = torch.randn(2, 384)  # batch=2
-    text_embeddings = torch.randn(2, 77, 2048)
-    text_pool = torch.randn(2, 1280)
+    Based on: library/train_util.py get_hidden_states_sdxl function
+    Reference code:
+    - states_list = [hidden_states1[:, 0].unsqueeze(1)]  # <BOS>
+    - for i in range(1, max_token_length, 77):
+    -     states_list.append(hidden_states1[:, i : i + 77 - 2])  # <BOS>后到<EOS>前
+    - states_list.append(hidden_states1[:, -1].unsqueeze(1))  # <EOS>
+    - pool = pool[::n_size]  # 只用第一个块的pool
+    """
+    batch_size = text_embeddings.shape[0]
 
-    # Forward
-    new_text_emb, new_text_pool = adapter(
-        lsnet_emb, text_embeddings, text_pool,
-        alpha=0.5, pooled_mode="add", token_insert_position=0
-    )
+    if insert_position == 1:
+        # 直接照抄SDXL逻辑：BOS + extra_tokens + 其余内容
+        # 相当于在"BOS后到EOS前"的逻辑中插入extra_tokens
+        bos_token = text_embeddings[:, 0:1]  # BOS
+        rest_after_bos = text_embeddings[:, 1:]  # BOS后的所有内容（包括EOS等）
+        extended = torch.cat([bos_token, extra_tokens, rest_after_bos], dim=1)
 
-    print(f"Original text_emb shape: {text_embeddings.shape}")
-    print(f"New text_emb shape: {new_text_emb.shape}")
-    print(f"Original text_pool shape: {text_pool.shape}")
-    print(f"New text_pool shape: {new_text_pool.shape}")
+    elif insert_position == 0:
+        # Insert before BOS - not following SDXL logic
+        extended = torch.cat([extra_tokens, text_embeddings], dim=1)
+
+    else:
+        # Insert at specific position
+        before = text_embeddings[:, :insert_position]
+        after = text_embeddings[:, insert_position:]
+        extended = torch.cat([before, extra_tokens, after], dim=1)
+
+    # 直接照抄SDXL pool处理：pool = pool[::n_size] - 只用第一个块的pool
+    # 在我们的情况下，original_pool就是第一个（也是唯一）块的pool，直接保持不变
+    return extended, original_pool
+
+
+import torch
+from backend_lsnet.adapter import LSNetToClipAdapter, extend_text_embeddings_sdxl_style
+
+# Test the new logic
+adapter = LSNetToClipAdapter(num_extra_tokens=4)
+lsnet_emb = torch.randn(1, 384)
+text_emb = torch.randn(1, 77, 2048)
+pool = torch.randn(1, 1280)
+
+# Test extend function
+lsnet_tokens = torch.randn(1, 4, 2048)
+extended_emb, new_pool = extend_text_embeddings_sdxl_style(text_emb, lsnet_tokens, pool, insert_position=1)
+print(f'Original shape: {text_emb.shape}')
+print(f'Extended shape: {extended_emb.shape}')
+print(f'Pool unchanged: {torch.allclose(pool, new_pool)}')
+
+# Test adapter
+new_emb, new_pool = adapter(lsnet_emb, text_emb, pool, pooled_mode='keep', token_insert_position=1)
+print(f'Adapter result shape: {new_emb.shape}')
+print(f'Pool kept: {torch.allclose(pool, new_pool)}')

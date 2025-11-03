@@ -342,10 +342,10 @@ def cache_to_disk(args: argparse.Namespace) -> None:
                     # Concatenate text embeddings
                     text_embeddings = torch.cat([text_encoder_outputs1, text_encoder_outputs2], dim=2)  # (1, 77, 2048)
 
-                    # Use adapter to prepend LSNet tokens AND update pool
+                    # Use adapter to prepend LSNet tokens, keep original pool unchanged
                     new_text_embeddings, new_text_pool2 = adapter(
-                        lsnet_emb, text_embeddings, text_encoder_pool2.unsqueeze(0),  # Include pooled fusion
-                        alpha=1.0, pooled_mode="add", token_insert_position=0
+                        lsnet_emb, text_embeddings, text_encoder_pool2.unsqueeze(0),
+                        alpha=1.0, pooled_mode="keep", token_insert_position=1  # After BOS, keep pool
                     )
 
                     # Split back to encoder1 and encoder2 outputs
