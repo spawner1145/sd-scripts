@@ -7,8 +7,18 @@ from multiprocessing import Value
 import os
 import sys
 
-# Add paths
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'comfyui_lsnet'))
+# Add paths for imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sd_scripts_root = os.path.dirname(script_dir)  # Parent of tools/
+comfyui_lsnet_root = os.path.join(sd_scripts_root, '..', 'comfyui_lsnet')
+
+# Add sd_scripts library to path (for library imports)
+sys.path.insert(0, sd_scripts_root)
+
+# Add ComfyUI LSNet paths
+sys.path.append(comfyui_lsnet_root)
+sys.path.append(os.path.join(comfyui_lsnet_root, 'lsnet_model'))
+sys.path.append(os.path.join(comfyui_lsnet_root, 'backend_lsnet'))
 
 from accelerate.utils import set_seed
 import torch
