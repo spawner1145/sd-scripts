@@ -354,7 +354,7 @@ def cache_to_disk(args: argparse.Namespace) -> None:
                     # Use adapter to prepend LSNet tokens, with pooled fusion
                     new_text_embeddings, new_text_pool2 = adapter(
                         lsnet_emb, text_embeddings, text_encoder_pool2.unsqueeze(0),
-                        alpha=0.5, pooled_mode="add", token_insert_position=1  # After BOS, fuse pool with alpha=0.5
+                        alpha=0.015, pooled_mode="keep", token_insert_position=1  # Keep pooled unchanged
                     )
 
                     # Split back to encoder1 and encoder2 outputs
