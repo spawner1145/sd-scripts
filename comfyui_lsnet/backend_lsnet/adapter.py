@@ -212,19 +212,19 @@ import torch
 from backend_lsnet.adapter import LSNetToClipAdapter, extend_text_embeddings_sdxl_style
 
 # Test the new logic
-adapter = LSNetToClipAdapter(num_extra_tokens=4)
+adapter = LSNetToClipAdapter(num_extra_tokens=40)
 lsnet_emb = torch.randn(1, 384)
 text_emb = torch.randn(1, 77, 2048)
 pool = torch.randn(1, 1280)
 
 # Test extend function
-lsnet_tokens = torch.randn(1, 4, 2048)
+lsnet_tokens = torch.randn(1, 40, 2048)
 extended_emb, new_pool = extend_text_embeddings_sdxl_style(text_emb, lsnet_tokens, pool, insert_position=1)
 print(f'Original shape: {text_emb.shape}')
 print(f'Extended shape: {extended_emb.shape}')
 print(f'Pool unchanged: {torch.allclose(pool, new_pool)}')
 
 # Test adapter
-new_emb, new_pool = adapter(lsnet_emb, text_emb, pool, pooled_mode='keep', token_insert_position=1)
+new_emb, new_pool = adapter(lsnet_emb, text_emb, pool, pooled_mode='add', token_insert_position=1)
 print(f'Adapter result shape: {new_emb.shape}')
-print(f'Pool kept: {torch.allclose(pool, new_pool)}')
+print(f'Pool fused: {not torch.allclose(pool, new_pool)}')
