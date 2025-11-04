@@ -59,7 +59,7 @@ class LSNetToClipAdapter(nn.Module):
             lsnet_emb: (batch, lsnet_feature_dim)
             text_pool: (batch, clip_pooled_dim)
             alpha: fusion weight
-            mode: "add" (text_pool + alpha * proj), "replace" (alpha * proj), "concat" (torch.cat)
+            mode: "add" (text_pool + alpha * proj), "replace" (alpha * proj), "concat" (torch.cat), "keep" (return text_pool unchanged)
 
         Returns:
             new_text_pool: (batch, clip_pooled_dim) or (batch, 2*clip_pooled_dim) if concat
@@ -75,6 +75,8 @@ class LSNetToClipAdapter(nn.Module):
             return alpha * proj_emb
         elif mode == "concat":
             return torch.cat([text_pool, proj_emb], dim=-1)
+        elif mode == "keep":
+            return text_pool  # Keep original pool unchanged
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
