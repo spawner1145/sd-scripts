@@ -557,7 +557,7 @@ class ConditioningFusion:
             lsnet_feature_dim=lsnet_emb.shape[-1],
             clip_hidden_dim=2048,
             clip_pooled_dim=1280,
-            num_extra_tokens=4,  # Same as training
+            num_extra_tokens=40,  # Increased from 4 to 40 tokens
             use_layer_norm=True,
             dropout=0.0
         )
@@ -570,10 +570,10 @@ class ConditioningFusion:
         text_embeddings = text_embeddings.to(device, dtype)
         text_encoder_pool2 = text_encoder_pool2.to(device, dtype)
         
-        # Use adapter to prepend LSNet tokens, keep original pool unchanged (follow SDXL logic)
+        # Use adapter to prepend LSNet tokens, with pooled fusion (modified from SDXL logic)
         new_text_embeddings, new_text_pool2 = adapter(
             lsnet_emb, text_embeddings, text_encoder_pool2.unsqueeze(0),
-            alpha=1.0, pooled_mode="keep", token_insert_position=1  # After BOS, keep pool
+            alpha=0.5, pooled_mode="add", token_insert_position=1  # After BOS, fuse pool with alpha=0.5
         )
         
         # Split back to encoder1 and encoder2 outputs
