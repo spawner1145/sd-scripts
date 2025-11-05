@@ -1,5 +1,5 @@
 # cache LSNet image embeddings to disk in advance for SDXL LoRA training
-# python tools/cache_lsnet_outputs.py --sdxl --cache_lsnet_outputs_to_disk --train_data_dir "/root/autodl-tmp/qianyi-test/lsnet_img" --output_dir "/root/autodl-tmp/qianyi-test/lsnet_img" --pretrained_model_name_or_path "/root/autodl-tmp/ComfyUI/models/checkpoints/noob_eps11.safetensors" --lsnet_model_folder "/root/autodl-tmp/ComfyUI/models/lsnet/kaloscope2" --resolution 1024 --max_data_loader_n_workers 0 --num_lsnet_tokens 4 --caption_extension=".txt" --max_token_length=225
+# python tools/cache_lsnet_outputs.py --sdxl --cache_lsnet_outputs_to_disk --train_data_dir "/root/autodl-tmp/qianyi-test/lsnet_img" --output_dir "/root/autodl-tmp/qianyi-test/lsnet_img" --pretrained_model_name_or_path "/root/autodl-tmp/ComfyUI/models/checkpoints/noob_eps11.safetensors" --lsnet_model_folder "/root/autodl-tmp/ComfyUI/models/lsnet/kaloscope2" --resolution 1024 --max_data_loader_n_workers 0 --num_lsnet_tokens 40 --caption_extension=".txt" --max_token_length 225
 import argparse
 import math
 from multiprocessing import Value
