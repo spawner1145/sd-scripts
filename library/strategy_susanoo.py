@@ -171,6 +171,10 @@ class SusanooLatentsCachingStrategy(LatentsCachingStrategy):
     def cache_suffix(self) -> str:
         return SusanooLatentsCachingStrategy.SUSANOO_LATENTS_NPZ_SUFFIX
 
+    def get_image_size_from_disk_cache_path(self, absolute_path: str, npz_path: str) -> tuple[Optional[int], Optional[int]]:
+        w, h = os.path.splitext(npz_path)[0].split("_")[-3].split("x")
+        return int(w), int(h)
+
     def get_latents_npz_path(self, absolute_path: str, image_size: tuple[int, int]) -> str:
         return (
             os.path.splitext(absolute_path)[0]
