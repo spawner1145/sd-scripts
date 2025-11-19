@@ -128,6 +128,39 @@ class SusanooTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy
         attention_mask = data["attention_mask"]
         return [last_hidden_state, input_ids, attention_mask]
 
+    def cache_batch_outputs(
+        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
+    ):
+        captions = [info.caption for info in infos]
+        tokens = tokenize_strategy.tokenize(captions)
+        
+        with torch.no_grad():
+            last_hidden_state, input_ids, attention_mask = text_encoding_strategy.encode_tokens(
+                tokenize_strategy, models, tokens
+            )
+
+        if last_hidden_state.dtype == torch.bfloat16:
+            last_hidden_state = last_hidden_state.float()
+        
+        last_hidden_state = last_hidden_state.cpu().numpy()
+        input_ids = input_ids.cpu().numpy()
+        attention_mask = attention_mask.cpu().numpy()
+
+        for i, info in enumerate(infos):
+            last_hidden_state_i = last_hidden_state[i]
+            input_ids_i = input_ids[i]
+            attention_mask_i = attention_mask[i]
+
+            if self.cache_to_disk:
+                np.savez(
+                    info.text_encoder_outputs_npz,
+                    last_hidden_state=last_hidden_state_i,
+                    input_ids=input_ids_i,
+                    attention_mask=attention_mask_i,
+                )
+            else:
+                info.text_encoder_outputs = [last_hidden_state_i, input_ids_i, attention_mask_i]
+
 class SusanooLatentsCachingStrategy(LatentsCachingStrategy):
     SUSANOO_LATENTS_NPZ_SUFFIX = "_susanoo_latents.npz"
 
