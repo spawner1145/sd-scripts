@@ -7,15 +7,18 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import random
 import time
 from typing import Callable, List, Optional
+import importlib
 
 import numpy as np
 import torch
 from tqdm import tqdm
 from PIL import Image
 from accelerate import init_empty_weights
+from safetensors.torch import load_file
 
 from library import device_utils
 from library.device_utils import init_ipex, get_preferred_device
+import networks.lora_susanoo as lora_susanoo
 
 init_ipex()
 
@@ -193,8 +196,10 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, default="bf16", help="Data type for inference: fp16, bf16, float32, fp8")
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32", "fp8"], help="Dtype")
     parser.add_argument("--offload", action="store_true", help="Offload models to CPU when not in use")
+    parser.add_argument("--lora_weights", type=str, nargs="*", default=[], help="LoRA weights, can be multiple. Format: path or path;multiplier")
+    parser.add_argument("--merge_lora_weights", action="store_true", help="Merge LoRA weights to model")
     
     args = parser.parse_args()
     
@@ -254,6 +259,38 @@ def main():
     if args.text_projection_path:
         text_projection = susanoo_utils.load_text_projection(args.text_projection_path, dtype, device)
     
+    # Load LoRA
+    lora_models = []
+    for weights_file in args.lora_weights:
+        if ";" in weights_file:
+            weights_file, multiplier = weights_file.split(";")
+            multiplier = float(multiplier)
+        else:
+            multiplier = 1.0
+
+        weights_sd = load_file(weights_file)
+        lora_model, _ = lora_susanoo.create_network_from_weights(
+            multiplier, 
+            weights_file, 
+            vae, 
+            text_encoder, 
+            model, 
+            weights_sd, 
+            True
+        )
+
+        if args.merge_lora_weights:
+            lora_model.merge_to(text_encoder, model, weights_sd, dtype, device)
+        else:
+            lora_model.apply_to(text_encoder, model)
+            info = lora_model.load_state_dict(weights_sd, strict=True)
+            logger.info(f"Loaded LoRA weights from {weights_file}: {info}")
+            lora_model.to(device)
+            lora_model.set_multiplier(multiplier)
+            lora_model.eval()
+
+        lora_models.append(lora_model)
+
     # Generate
     logger.info("Generating image...")
     
