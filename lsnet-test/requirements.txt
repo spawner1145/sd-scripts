@@ -1,0 +1,25 @@
+einops
+fvcore
+easydict
+matplotlib
+yacs
+scikit-image
+wandb
+torch>=2.4.1
+torchvision>=0.11.0
+
+timm
+
+numpy>=1.19.0
+Pillow>=8.0.0
+
+scikit-learn>=1.0.0
+
+matplotlib>=3.3.0
+seaborn>=0.11.0
+
+tqdm>=4.60.0
+
+# 可选：加速训练
+# tensorboard>=2.8.0
+# apex  # 混合精度训练（需要从源码安装）
