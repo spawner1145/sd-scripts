@@ -254,6 +254,8 @@ def create_network(
         module_dropout=kwargs.get("module_dropout", None),
         conv_lora_dim=conv_dim,
         conv_alpha=conv_alpha,
+        modules_dim=kwargs.get("modules_dim", None),
+        modules_alpha=kwargs.get("modules_alpha", None),
         varbose=kwargs.get("varbose", False),
     )
 
@@ -264,6 +266,8 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
         if file is None:
             raise ValueError("file or weights_sd must be specified")
         weights_sd, metadata = lora.load_state_dict_with_metadata(file)
+    else:
+        metadata = {}
     
     # Get dim/alpha from weights if possible
     # This is a simplified version, assuming standard LoRA
@@ -316,6 +320,25 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
         
     if network_alpha is None:
         network_alpha = 1.0 # Default
+
+    # Parse modules_dim and modules_alpha from weights_sd
+    modules_dim = {}
+    modules_alpha = {}
+    for key, value in weights_sd.items():
+        if "." not in key:
+            continue
+        
+        lora_name = key.split(".")[0]
+        if "alpha" in key:
+            modules_alpha[lora_name] = value
+        elif "lora_down" in key:
+            dim = value.size()[0]
+            modules_dim[lora_name] = dim
+            
+    # support old LoRA without alpha
+    for key in modules_dim.keys():
+        if key not in modules_alpha:
+            modules_alpha[key] = modules_dim[key]
         
     network = create_network(
         multiplier,
@@ -324,10 +347,12 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
         vae,
         text_encoder,
         unet,
+        modules_dim=modules_dim,
+        modules_alpha=modules_alpha,
         **kwargs
     )
     
-    info = network.load_state_dict(weights_sd, strict=False)
-    logger.info(f"Loaded Susanoo LoRA weights: {info}")
+    # info = network.load_state_dict(weights_sd, strict=False)
+    # logger.info(f"Loaded Susanoo LoRA weights: {info}")
     
-    return network
+    return network, weights_sd
