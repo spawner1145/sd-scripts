@@ -1,3 +1,6 @@
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
 import argparse
 import math
 import os
@@ -29,7 +32,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 def train(args):
-    train_util.verify_training_args(args)
+    # train_util.verify_training_args(args) # Skip this as it checks for v2/sdxl specific args
     train_util.prepare_dataset_args(args, True)
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
@@ -148,12 +151,15 @@ def train(args):
     else:
         # Load for training
         text_encoder = susanoo_utils.load_text_encoder(args.text_encoder_path, weight_dtype, accelerator.device)
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
         sample_prompts_te_outputs = None
 
     # 2. VAE (Flux)
     vae = None
     if not args.cache_latents:
         vae = susanoo_utils.load_vae(args.vae, vae_dtype, accelerator.device)
+        vae.to(accelerator.device, dtype=vae_dtype)
+        vae.eval()
 
     # 3. UNet (LSUNet)
     if args.lsunet_path:
@@ -162,7 +168,8 @@ def train(args):
         unet = susanoo_utils.create_lsunet(weight_dtype, accelerator.device)
     
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing(cpu_offload=args.cpu_offload_checkpointing)
+        # unet.enable_gradient_checkpointing(cpu_offload=args.cpu_offload_checkpointing)
+        unet.enable_gradient_checkpointing()
 
     # 4. Text Projection (Optional/Fallback)
     # Check dimensions
@@ -339,14 +346,21 @@ def train(args):
                 
                 noisy_latents, timesteps, sigmas = susanoo_train_utils.get_noisy_model_input_and_timesteps(args, noise, latents, accelerator.device)
                 
+                if args.gradient_checkpointing:
+                    noisy_latents.requires_grad_(True)
+
                 # Velocity Target
                 # v = dx_t/dt = -x_0 + x_1 = noise - latents
-                target = noise - latents 
+                if args.model_prediction_type == "sigma_scaled":
+                    target = latents
+                else:
+                    target = noise - latents
 
                 # 6. Predict
                 # LSUNet expects timesteps in 0-1000 range for embedding lookup (SDXL style)
                 # t=0 -> 0 (Data), t=1 -> 1000 (Noise)
-                model_pred = unet(noisy_latents, timesteps * 1000, encoder_hidden_states, context_mask=attention_mask)
+                with accelerator.autocast():
+                    model_pred = unet(noisy_latents, timesteps * 1000, encoder_hidden_states, context_mask=attention_mask)
 
                 # Apply Model Prediction Type
                 model_pred, weighting = susanoo_train_utils.apply_model_prediction_type(args, model_pred, noisy_latents, sigmas)

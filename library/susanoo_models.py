@@ -471,8 +471,25 @@ try:
 
             grid = lambda meta: _grid(numel, meta["BS"])
 
-            ct = tl.float16 if x.dtype == torch.float16 else (tl.float32 if x.dtype == torch.float32 else tl.float64)
-            at = tl.float32 if x.dtype == torch.float16 else ct
+            if x.dtype == torch.float16:
+                ct = tl.float16
+                at = tl.float32
+            elif x.dtype == torch.bfloat16:
+                ct = tl.bfloat16
+                at = tl.float32
+            elif x.dtype == torch.float32:
+                ct = tl.float32
+                at = tl.float32
+            elif hasattr(torch, "float8_e4m3fn") and x.dtype == torch.float8_e4m3fn:
+                ct = tl.float8e4nv
+                at = tl.float32
+            elif hasattr(torch, "float8_e5m2") and x.dtype == torch.float8_e5m2:
+                ct = tl.float8e5
+                at = tl.float32
+            else:
+                # Fallback for other types (e.g. float64), though typically not used in this context
+                ct = tl.float32
+                at = tl.float32
 
             ska_fwd[grid](x, w, o, n, ic, h, width, ks, pad, wc, BS=1024, CT=ct, AT=at)
 
@@ -534,6 +551,16 @@ class SKA(torch.nn.Module):
     _fallback_logged = False
 
     def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        # Fallback for unsupported types to BF16/FP16
+        supported_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+        if hasattr(torch, "float8_e4m3fn"): supported_dtypes.append(torch.float8_e4m3fn)
+        if hasattr(torch, "float8_e5m2"): supported_dtypes.append(torch.float8_e5m2)
+
+        if x.dtype not in supported_dtypes:
+            target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            x = x.to(target_dtype)
+            w = w.to(target_dtype)
+
         if SkaFn is not None:
             try:
                 return SkaFn.apply(x, w)  # type: ignore
@@ -704,7 +731,15 @@ def get_parameter_device(parameter: torch.nn.Module):
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+        if x.dtype == torch.float32:
+            return super().forward(x)
+        return F.group_norm(
+            x.float(), 
+            self.num_groups, 
+            self.weight.float() if self.weight is not None else None, 
+            self.bias.float() if self.bias is not None else None, 
+            self.eps
+        ).type(x.dtype)
 
 class ResnetBlock2D(nn.Module):
     def __init__(
@@ -865,7 +900,7 @@ class CrossAttention(nn.Module):
             # This is a heuristic. If the user passes an additive mask, we shouldn't break it.
             # But here we know we are passing tokenizer mask (0/1).
             if mask.dtype != torch.bool and mask.min() > -1:
-                 new_mask = torch.zeros_like(mask)
+                 new_mask = torch.zeros_like(mask, dtype=hidden_states.dtype)
                  new_mask.masked_fill_(mask == 0, float("-inf"))
                  mask = new_mask
             elif mask.dtype == torch.bool:
@@ -963,6 +998,19 @@ class CrossAttention(nn.Module):
         out = self.to_out[0](out)
         return out
 
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
 class GEGLU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
@@ -991,9 +1039,23 @@ class FeedForward(nn.Module):
             hidden_states = module(hidden_states)
         return hidden_states
 
+class AdaLayerNorm(nn.Module):
+    def __init__(self, embedding_dim, channels, eps=1e-6):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, channels * 2)
+        self.norm = RMSNorm(channels, eps=eps)
+
+    def forward(self, x, timestep_emb):
+        emb = self.linear(self.silu(timestep_emb))
+        scale, shift = torch.chunk(emb, 2, dim=1)
+        x = self.norm(x)
+        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return x
+
 class LSUNetBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, time_embed_dim: Optional[int] = None
     ):
         super().__init__()
         self.gradient_checkpointing = False
@@ -1011,9 +1073,14 @@ class LSUNetBlock(nn.Module):
             upcast_attention=upcast_attention,
         )
 
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
+        self.norm1 = RMSNorm(dim)
+        
+        if time_embed_dim is not None:
+            self.norm2 = AdaLayerNorm(time_embed_dim, dim)
+            self.norm3 = AdaLayerNorm(time_embed_dim, dim)
+        else:
+            self.norm2 = RMSNorm(dim)
+            self.norm3 = RMSNorm(dim)
 
         # 3. Feed-forward
         self.ff = FeedForward(dim)
@@ -1040,11 +1107,20 @@ class LSUNetBlock(nn.Module):
         hidden_states = x
 
         # 2. Cross-Attention
-        norm_hidden_states = self.norm2(hidden_states)
+        if isinstance(self.norm2, AdaLayerNorm):
+             norm_hidden_states = self.norm2(hidden_states, timestep)
+        else:
+             norm_hidden_states = self.norm2(hidden_states)
+             
         hidden_states = self.attn2(norm_hidden_states, context=context, mask=context_mask) + hidden_states
 
         # 3. Feed-forward
-        hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
+        if isinstance(self.norm3, AdaLayerNorm):
+            norm_hidden_states = self.norm3(hidden_states, timestep)
+        else:
+            norm_hidden_states = self.norm3(hidden_states)
+            
+        hidden_states = self.ff(norm_hidden_states) + hidden_states
 
         return hidden_states
 
@@ -1082,6 +1158,7 @@ class LSTransformer2DModel(nn.Module):
         use_linear_projection: bool = False,
         upcast_attention: bool = False,
         num_transformer_layers: int = 1,
+        time_embed_dim: Optional[int] = None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1106,6 +1183,7 @@ class LSTransformer2DModel(nn.Module):
                     attention_head_dim,
                     cross_attention_dim=cross_attention_dim,
                     upcast_attention=upcast_attention,
+                    time_embed_dim=time_embed_dim,
                 )
             )
 
@@ -1245,6 +1323,7 @@ class LSUNet(nn.Module):
                     num_transformer_layers=2,
                     use_linear_projection=True,
                     cross_attention_dim=CONTEXT_DIM,
+                    time_embed_dim=self.time_embed_dim,
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1262,6 +1341,7 @@ class LSUNet(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=CONTEXT_DIM,
+                    time_embed_dim=self.time_embed_dim,
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1277,6 +1357,7 @@ class LSUNet(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=CONTEXT_DIM,
+                    time_embed_dim=self.time_embed_dim,
                 ),
                 ResnetBlock2D(in_channels=4 * self.model_channels, out_channels=4 * self.model_channels),
             ]
@@ -1299,6 +1380,7 @@ class LSUNet(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=CONTEXT_DIM,
+                    time_embed_dim=self.time_embed_dim,
                 ),
             ]
             if i == 2:
@@ -1319,6 +1401,7 @@ class LSUNet(nn.Module):
                     num_transformer_layers=2,
                     use_linear_projection=True,
                     cross_attention_dim=CONTEXT_DIM,
+                    time_embed_dim=self.time_embed_dim,
                 ),
             ]
             if i == 2:
@@ -1400,7 +1483,7 @@ class LSUNet(nn.Module):
                 if isinstance(layer, ResnetBlock2D):
                     x = layer(x, emb)
                 elif isinstance(layer, LSTransformer2DModel):
-                    x = layer(x, context, context_mask=context_mask)
+                    x = layer(x, context, context_mask=context_mask, timestep=emb)
                 else:
                     x = layer(x)
             return x

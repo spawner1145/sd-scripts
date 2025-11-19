@@ -11,7 +11,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SusanooTokenizeStrategy(TokenizeStrategy):
-    def __init__(self, tokenizer_path: str, max_length: int = 77, system_prompt: Optional[str] = None) -> None:
+    def __init__(self, tokenizer_path: str, max_length: int = 512, system_prompt: Optional[str] = None) -> None:
         self.tokenizer_path = tokenizer_path
         self.max_length = max_length
         self.system_prompt = system_prompt
@@ -23,26 +23,35 @@ class SusanooTokenizeStrategy(TokenizeStrategy):
     def tokenize(self, text: Union[str, List[str]]) -> List[torch.Tensor]:
         text = [text] if isinstance(text, str) else text
         
-        if self.system_prompt:
-            new_text = []
-            for t in text:
-                if hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None:
-                    try:
-                        messages = [
-                            {"role": "system", "content": self.system_prompt},
-                            {"role": "user", "content": t}
-                        ]
-                        full_prompt = self.tokenizer.apply_chat_template(
-                            messages, 
-                            add_generation_prompt=False, 
-                            tokenize=False
-                        )
-                    except Exception:
-                        full_prompt = f"{self.system_prompt} <Prompt Start> {t}"
-                else:
-                    full_prompt = f"{self.system_prompt} <Prompt Start> {t}"
+        new_text = []
+        for t in text:
+            # Check if tokenizer has a chat template (e.g. Qwen-Chat)
+            if hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None:
+                try:
+                    messages = []
+                    if self.system_prompt:
+                        messages.append({"role": "system", "content": self.system_prompt})
+                    messages.append({"role": "user", "content": t})
+                    
+                    full_prompt = self.tokenizer.apply_chat_template(
+                        messages, 
+                        add_generation_prompt=False, 
+                        tokenize=False
+                    )
+                    new_text.append(full_prompt)
+                    continue
+                except Exception as e:
+                    logger.warning(f"Failed to apply chat template: {e}")
+                    # Fallback to manual formatting below
+            
+            # Fallback or no chat template
+            if self.system_prompt:
+                full_prompt = f"{self.system_prompt} <Prompt Start> {t}"
                 new_text.append(full_prompt)
-            text = new_text
+            else:
+                new_text.append(t)
+        
+        text = new_text
         
         tokens = self.tokenizer(
             text, 
