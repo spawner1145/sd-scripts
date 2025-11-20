@@ -620,14 +620,18 @@ class Conv2d_BN(torch.nn.Sequential):
         super().__init__()
         self.add_module('c', torch.nn.Conv2d(
             a, b, ks, stride, pad, dilation, groups, bias=False))
-        self.add_module('bn', torch.nn.BatchNorm2d(b))
+        # Replaced BatchNorm2d with GroupNorm
+        # Using 32 groups is standard for SD/SDXL. If channels < 32, use 1 group (LayerNorm equivalent)
+        num_groups = 32 if b % 32 == 0 else (16 if b % 16 == 0 else 1)
+        self.add_module('bn', torch.nn.GroupNorm(num_groups=num_groups, num_channels=b))
         torch.nn.init.constant_(self.bn.weight, bn_weight_init)
         torch.nn.init.constant_(self.bn.bias, 0)
 
 class BN_Linear(torch.nn.Sequential):
     def __init__(self, a, b, bias=True, std=0.02):
         super().__init__()
-        self.add_module('bn', torch.nn.BatchNorm1d(a))
+        # Replaced BatchNorm1d with RMSNorm
+        self.add_module('bn', RMSNorm(a))
         self.add_module('l', torch.nn.Linear(a, b, bias=bias))
         trunc_normal_(self.l.weight, std=std)
         if bias:
@@ -683,7 +687,9 @@ class LSConv(nn.Module):
         super(LSConv, self).__init__()
         self.lkp = LKP(dim, lks=7, sks=3, groups=8)
         self.ska = SKA()
-        self.bn = nn.BatchNorm2d(dim)
+        # Replaced BatchNorm2d with GroupNorm
+        num_groups = 32 if dim % 32 == 0 else (16 if dim % 16 == 0 else 1)
+        self.bn = nn.GroupNorm(num_groups=num_groups, num_channels=dim)
 
     def forward(self, x):
         return self.bn(self.ska(x, self.lkp(x))) + x
