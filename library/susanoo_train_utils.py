@@ -25,7 +25,7 @@ def add_susanoo_train_arguments(parser: argparse.ArgumentParser):
     
     # Flux-like arguments
     parser.add_argument("--discrete_flow_shift", type=float, default=3.0, help="Discrete flow shift for the Euler Discrete Scheduler")
-    parser.add_argument("--model_prediction_type", choices=["raw", "additive", "sigma_scaled"], default="sigma_scaled", help="How to interpret and process the model prediction")
+    parser.add_argument("--model_prediction_type", choices=["raw", "additive", "sigma_scaled"], default="raw", help="How to interpret and process the model prediction. 'raw' predicts v (velocity) directly. 'sigma_scaled' predicts x0 but requires weighting_scheme='sigma_sqrt' to be equivalent to v-prediction.")
     parser.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"], default="sigma", help="Method to sample timesteps")
     parser.add_argument("--sigmoid_scale", type=float, default=1.0, help="Scale factor for sigmoid timestep sampling")
     parser.add_argument("--guidance_scale", type=float, default=1.0, help="Guidance scale for training (if applicable)")
