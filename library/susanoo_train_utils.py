@@ -26,7 +26,7 @@ def add_susanoo_train_arguments(parser: argparse.ArgumentParser):
     # Flux-like arguments
     parser.add_argument("--discrete_flow_shift", type=float, default=3.0, help="Discrete flow shift for the Euler Discrete Scheduler")
     parser.add_argument("--model_prediction_type", choices=["raw", "additive", "sigma_scaled"], default="raw", help="How to interpret and process the model prediction. 'raw' predicts v (velocity) directly. 'sigma_scaled' predicts x0 but requires weighting_scheme='sigma_sqrt' to be equivalent to v-prediction.")
-    parser.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"], default="sigma", help="Method to sample timesteps")
+    parser.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"], default="shift", help="Method to sample timesteps")
     parser.add_argument("--sigmoid_scale", type=float, default=1.0, help="Scale factor for sigmoid timestep sampling")
     parser.add_argument("--guidance_scale", type=float, default=1.0, help="Guidance scale for training (if applicable)")
     # parser.add_argument("--sample_prompts", type=str, default=None, help="Path to file with prompts to sample") # Conflict with train_util
@@ -327,20 +327,16 @@ def get_noisy_model_input_and_timesteps(args, noise, latents, device):
             t = torch.rand((bs,), device=device)
             timesteps = (t * args.discrete_flow_shift) / (1 + (args.discrete_flow_shift - 1) * t)
         elif args.timestep_sampling == "flux_shift":
-            # Flux Shift Sampling (Logit-Normal with shift)
-            sigmas = torch.randn(bs, device=device)
-            sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
-            sigmas = sigmas.sigmoid()
+            # Flux Shift Sampling (Uniform with shift)
+            # Flux uses simple uniform sampling t ~ U[0,1] then applies shift
+            t = torch.rand((bs,), device=device)
+            
             # Flux uses packed latents size for shift calculation. 
             # Here we use latent size directly. 
-            # Flux: (h//2) * (w//2) corresponds to patch count / 4? No, patch count is (h/2)*(w/2).
-            # Wait, Flux latents are H/8, W/8. Patches are 2x2.
-            # So patch count is (H/16)*(W/16).
-            # In flux_train_utils.py: (h // 2) * (w // 2) where h, w are latent dims.
+            # Flux: (h//2) * (w//2) where h, w are latent dims.
             # So it is (H/16)*(W/16).
-            # So we should use the same logic.
             mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
-            timesteps = time_shift(mu, 1.0, sigmas)
+            timesteps = time_shift(mu, 1.0, t)
         else:
             timesteps = torch.rand((bs,), device=device)
 
@@ -358,8 +354,16 @@ def apply_model_prediction_type(args, model_pred, noisy_latents, sigmas):
         # model_pred is additive noise
         model_pred = model_pred + noisy_latents
     elif args.model_prediction_type == "sigma_scaled":
-        # model_pred is sigma scaled
-        model_pred = model_pred * (-sigmas) + noisy_latents
+        # model_pred is x0
+        # In Flow Matching: x_t = (1-t)x_0 + t*x_1
+        # v = x_1 - x_0
+        # x_t = x_0 + t*v  => v = (x_t - x_0) / t
+        # We want to convert x0_pred to v_pred to match the target (v)
+        # v_pred = (noisy_latents - model_pred) / sigmas
+        
+        # Avoid division by zero
+        sigmas = sigmas.clamp(min=1e-5)
+        model_pred = (noisy_latents - model_pred) / sigmas
         
         # Apply weighting if specified (SD3 style)
         if hasattr(args, "weighting_scheme") and args.weighting_scheme != "none":
