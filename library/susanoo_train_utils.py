@@ -218,7 +218,29 @@ def sample_image_inference(
         # 4. Denoising Loop
         for t in scheduler.timesteps:
             # Model prediction
+            # Note: scheduler.timesteps are in 0-1000 range usually for Diffusers schedulers?
+            # FlowMatchEulerDiscreteScheduler in Diffusers usually works with sigmas (0-1) if configured correctly,
+            # but let's check what scheduler.timesteps returns.
+            # If we initialized with num_train_timesteps=1000, it returns 1000 down to 0.
+            # Our model expects 0-1000.
+            
             model_pred = unet(latents, t, encoder_hidden_states, context_mask=attention_mask)
+            
+            # Handle Model Prediction Type for Inference
+            # If model predicts x0 (sigma_scaled), convert to v for scheduler
+            if args.model_prediction_type == "sigma_scaled":
+                # v = (x_t - x_0) / sigma
+                # sigma corresponds to t (normalized 0-1)
+                # t from scheduler is 0-1000.
+                sigma = t / 1000.0
+                
+                # Avoid division by zero at t=0
+                if sigma < 1e-5:
+                    sigma = 1e-5
+                
+                # Ensure sigma is on the correct device and broadcastable
+                # t is likely a scalar tensor, possibly on CPU
+                model_pred = (latents - model_pred) / sigma
             
             # Step
             latents = scheduler.step(model_pred, t, latents).prev_sample
