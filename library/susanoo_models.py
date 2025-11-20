@@ -1015,8 +1015,8 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        output = self._norm(x.float())
+        return (output * self.weight.float()).type_as(x)
 
 class GEGLU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int):
