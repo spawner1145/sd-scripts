@@ -50,7 +50,7 @@ def train(args):
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
     # Tokenizer Strategy
-    susanoo_tokenize_strategy = strategy_susanoo.SusanooTokenizeStrategy(args.text_encoder_path, args.max_token_length or 77, args.system_prompt)
+    susanoo_tokenize_strategy = strategy_susanoo.SusanooTokenizeStrategy(args.text_encoder_path, args.max_token_length or 512, args.system_prompt)
     strategy_base.TokenizeStrategy.set_strategy(susanoo_tokenize_strategy)
 
     # Tokenizer (for other uses if needed, though strategy handles it)

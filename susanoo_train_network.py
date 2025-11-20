@@ -158,7 +158,7 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
         return model_pred, target, timesteps, None
 
     def get_tokenize_strategy(self, args):
-        return strategy_susanoo.SusanooTokenizeStrategy(args.text_encoder_path, args.max_token_length or 77, args.system_prompt)
+        return strategy_susanoo.SusanooTokenizeStrategy(args.text_encoder_path, args.max_token_length or 512, args.system_prompt)
 
     def get_tokenizers(self, tokenize_strategy):
         return [tokenize_strategy.tokenizer]

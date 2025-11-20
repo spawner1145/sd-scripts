@@ -97,7 +97,7 @@ def generate_image(
     # Max length set to 512 as requested
     tokenize_strategy = strategy_susanoo.SusanooTokenizeStrategy(
         tokenizer_path, 
-        max_length=512, 
+        max_length=args.max_token_length, 
         system_prompt=system_prompt
     )
     
@@ -200,6 +200,7 @@ def main():
     parser.add_argument("--offload", action="store_true", help="Offload models to CPU when not in use")
     parser.add_argument("--lora_weights", type=str, nargs="*", default=[], help="LoRA weights, can be multiple. Format: path or path;multiplier")
     parser.add_argument("--merge_lora_weights", action="store_true", help="Merge LoRA weights to model")
+    parser.add_argument("--max_token_length", type=int, default=512, help="Max token length for tokenizer")
     
     args = parser.parse_args()
     
@@ -236,13 +237,9 @@ def main():
     model.eval()
     
     # 2. VAE
-    if args.offload:
-        vae = susanoo_utils.load_vae(args.vae_path, aux_dtype, "cpu")
-    else:
-        vae = susanoo_utils.load_vae(args.vae_path, aux_dtype, device)
-        vae.to(device, dtype=aux_dtype)
+    vae = susanoo_utils.load_vae(args.vae_path, dtype, device)
     vae.eval()
-    
+
     # 3. Text Encoder (Qwen)
     if args.offload:
         text_encoder = susanoo_utils.load_text_encoder(args.text_encoder_path, aux_dtype, "cpu")
@@ -258,6 +255,7 @@ def main():
     text_projection = None
     if args.text_projection_path:
         text_projection = susanoo_utils.load_text_projection(args.text_projection_path, dtype, device)
+        text_projection.eval()
     
     # Load LoRA
     lora_models = []
@@ -283,7 +281,7 @@ def main():
             lora_model.merge_to(text_encoder, model, weights_sd, dtype, device)
         else:
             lora_model.apply_to(text_encoder, model)
-            info = lora_model.load_state_dict(weights_sd, strict=True)
+            info = lora_model.load_state_dict(weights_sd, strict=False)
             logger.info(f"Loaded LoRA weights from {weights_file}: {info}")
             lora_model.to(device)
             lora_model.set_multiplier(multiplier)
