@@ -324,12 +324,14 @@ def get_noisy_model_input_and_timesteps(args, noise, latents, device):
             timesteps = torch.sigmoid(t * args.sigmoid_scale)
         elif args.timestep_sampling == "shift":
             # Shift Sampling (Simple shift)
-            t = torch.rand((bs,), device=device)
+            t = torch.randn((bs,), device=device)
+            t = torch.sigmoid(t * args.sigmoid_scale)
             timesteps = (t * args.discrete_flow_shift) / (1 + (args.discrete_flow_shift - 1) * t)
         elif args.timestep_sampling == "flux_shift":
             # Flux Shift Sampling (Uniform with shift)
             # Flux uses simple uniform sampling t ~ U[0,1] then applies shift
-            t = torch.rand((bs,), device=device)
+            t = torch.randn((bs,), device=device)
+            t = torch.sigmoid(t * args.sigmoid_scale)
             
             # Flux uses packed latents size for shift calculation. 
             # Here we use latent size directly. 

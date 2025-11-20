@@ -351,10 +351,11 @@ def train(args):
 
                 # Velocity Target
                 # v = dx_t/dt = -x_0 + x_1 = noise - latents
-                if args.model_prediction_type == "sigma_scaled":
-                    target = latents
-                else:
-                    target = noise - latents
+                # if args.model_prediction_type == "sigma_scaled":
+                #     target = latents
+                # else:
+                #     target = noise - latents
+                target = noise - latents
 
                 # 6. Predict
                 # LSUNet expects timesteps in 0-1000 range for embedding lookup (SDXL style)

@@ -133,12 +133,13 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
             )
 
         # Flow Matching Target
-        if args.model_prediction_type == "sigma_scaled":
-            # Target is x_0 (latents)
-            target = latents
-        else:
-            # Target is v (noise - latents)
-            target = noise - latents
+        # if args.model_prediction_type == "sigma_scaled":
+        #     # Target is x_0 (latents)
+        #     target = latents
+        # else:
+        #     # Target is v (noise - latents)
+        #     target = noise - latents
+        target = noise - latents
 
         # Apply Model Prediction Type
         # If sigma_scaled, model_pred (v) is converted to x_0
