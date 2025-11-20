@@ -614,16 +614,28 @@ def to_cpu(x):
     else:
         return x
 
+class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        if x.dtype == torch.float32:
+            return super().forward(x)
+        return F.group_norm(
+            x.float(), 
+            self.num_groups, 
+            self.weight.float() if self.weight is not None else None, 
+            self.bias.float() if self.bias is not None else None, 
+            self.eps
+        ).type(x.dtype)
+
 class Conv2d_BN(torch.nn.Sequential):
     def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
                  groups=1, bn_weight_init=1):
         super().__init__()
         self.add_module('c', torch.nn.Conv2d(
             a, b, ks, stride, pad, dilation, groups, bias=False))
-        # Replaced BatchNorm2d with GroupNorm
+        # Replaced BatchNorm2d with GroupNorm32 for FP32 stability
         # Using 32 groups is standard for SD/SDXL. If channels < 32, use 1 group (LayerNorm equivalent)
         num_groups = 32 if b % 32 == 0 else (16 if b % 16 == 0 else 1)
-        self.add_module('bn', torch.nn.GroupNorm(num_groups=num_groups, num_channels=b))
+        self.add_module('bn', GroupNorm32(num_groups=num_groups, num_channels=b))
         torch.nn.init.constant_(self.bn.weight, bn_weight_init)
         torch.nn.init.constant_(self.bn.bias, 0)
 
@@ -654,7 +666,7 @@ class FFN(torch.nn.Module):
     def __init__(self, ed, h):
         super().__init__()
         self.pw1 = Conv2d_BN(ed, h)
-        self.act = torch.nn.ReLU()
+        self.act = torch.nn.SiLU()
         self.pw2 = Conv2d_BN(h, ed, bn_weight_init=0)
 
     def forward(self, x):
@@ -665,11 +677,14 @@ class LKP(nn.Module):
     def __init__(self, dim, lks, sks, groups):
         super().__init__()
         self.cv1 = Conv2d_BN(dim, dim // 2)
-        self.act = nn.ReLU()
+        self.act = nn.SiLU()
         self.cv2 = Conv2d_BN(dim // 2, dim // 2, ks=lks, pad=(lks - 1) // 2, groups=dim // 2)
         self.cv3 = Conv2d_BN(dim // 2, dim // 2)
-        self.cv4 = nn.Conv2d(dim // 2, sks ** 2 * dim // groups, kernel_size=1)
-        self.norm = nn.GroupNorm(num_groups=dim // groups, num_channels=sks ** 2 * dim // groups)
+        self.cv4 = nn.Conv2d(dim // 2, sks ** 2 * dim // groups, kernel_size=1, bias=False)
+        self.norm = GroupNorm32(num_groups=dim // groups, num_channels=sks ** 2 * dim // groups)
+        # Zero-initialize the last norm to ensure LSConv starts as identity (since it's in a residual block)
+        nn.init.zeros_(self.norm.weight)
+        nn.init.zeros_(self.norm.bias)
         
         self.sks = sks
         self.groups = groups
@@ -687,12 +702,10 @@ class LSConv(nn.Module):
         super(LSConv, self).__init__()
         self.lkp = LKP(dim, lks=7, sks=3, groups=8)
         self.ska = SKA()
-        # Replaced BatchNorm2d with GroupNorm
-        num_groups = 32 if dim % 32 == 0 else (16 if dim % 16 == 0 else 1)
-        self.bn = nn.GroupNorm(num_groups=num_groups, num_channels=dim)
+        # Removed internal BN and residual to allow Pre-Norm in Block
 
     def forward(self, x):
-        return self.bn(self.ska(x, self.lkp(x))) + x
+        return self.ska(x, self.lkp(x))
 
 # ==========================================
 # LSUNet (Modified SDXL UNet)
@@ -734,18 +747,6 @@ def get_parameter_device(parameter: torch.nn.Module):
         return next(parameter.parameters()).device
     except StopIteration:
         return torch.device("cpu")
-
-class GroupNorm32(nn.GroupNorm):
-    def forward(self, x):
-        if x.dtype == torch.float32:
-            return super().forward(x)
-        return F.group_norm(
-            x.float(), 
-            self.num_groups, 
-            self.weight.float() if self.weight is not None else None, 
-            self.bias.float() if self.bias is not None else None, 
-            self.eps
-        ).type(x.dtype)
 
 class ResnetBlock2D(nn.Module):
     def __init__(
@@ -1050,6 +1051,9 @@ class AdaLayerNorm(nn.Module):
         super().__init__()
         self.silu = nn.SiLU()
         self.linear = nn.Linear(embedding_dim, channels * 2)
+        # Zero-initialize the linear layer for adaLN-Zero behavior
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
         self.norm = RMSNorm(channels, eps=eps)
 
     def forward(self, x, timestep_emb):
@@ -1079,12 +1083,12 @@ class LSUNetBlock(nn.Module):
             upcast_attention=upcast_attention,
         )
 
-        self.norm1 = RMSNorm(dim)
-        
         if time_embed_dim is not None:
+            self.norm1 = AdaLayerNorm(time_embed_dim, dim)
             self.norm2 = AdaLayerNorm(time_embed_dim, dim)
             self.norm3 = AdaLayerNorm(time_embed_dim, dim)
         else:
+            self.norm1 = RMSNorm(dim)
             self.norm2 = RMSNorm(dim)
             self.norm3 = RMSNorm(dim)
 
@@ -1097,20 +1101,30 @@ class LSUNetBlock(nn.Module):
     def set_use_sdpa(self, sdpa: bool):
         self.attn2.set_use_sdpa(sdpa)
 
-    def forward_body(self, hidden_states, context=None, context_mask=None, timestep=None):
+    def forward_body(self, hidden_states, context=None, context_mask=None, timestep=None, height=None, width=None):
         # hidden_states is (B, N, C)
         B, N, C = hidden_states.shape
-        H = int(math.sqrt(N))
-        W = H
+        if height is None or width is None:
+            H = int(math.sqrt(N))
+            W = H
+        else:
+            H = height
+            W = width
         
         # 1. LSConv (Spatial Mixing)
+        residual = hidden_states
+        if isinstance(self.norm1, AdaLayerNorm):
+            norm_hidden_states = self.norm1(hidden_states, timestep)
+        else:
+            norm_hidden_states = self.norm1(hidden_states)
+
         # Reshape to (B, C, H, W)
-        x = hidden_states.permute(0, 2, 1).reshape(B, C, H, W)
+        x = norm_hidden_states.permute(0, 2, 1).reshape(B, C, H, W)
         x = self.ls_conv(x)
         # Reshape back to (B, N, C)
-        x = x.reshape(B, C, N).permute(0, 2, 1)
+        x = x.reshape(B, C, H * W).permute(0, 2, 1)
         
-        hidden_states = x
+        hidden_states = x + residual
 
         # 2. Cross-Attention
         if isinstance(self.norm2, AdaLayerNorm):
@@ -1130,7 +1144,7 @@ class LSUNetBlock(nn.Module):
 
         return hidden_states
 
-    def forward(self, hidden_states, context=None, context_mask=None, timestep=None):
+    def forward(self, hidden_states, context=None, context_mask=None, timestep=None, height=None, width=None):
         if self.training and self.gradient_checkpointing:
             if self.cpu_offload_checkpointing:
                 def create_custom_forward(func):
@@ -1140,7 +1154,7 @@ class LSUNetBlock(nn.Module):
                         return to_cpu(outputs)
                     return custom_forward
                 output = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(self.forward_body), hidden_states, context, context_mask, timestep, use_reentrant=False
+                    create_custom_forward(self.forward_body), hidden_states, context, context_mask, timestep, height, width, use_reentrant=False
                 )
             else:
                 def create_custom_forward(func):
@@ -1148,10 +1162,10 @@ class LSUNetBlock(nn.Module):
                         return func(*inputs)
                     return custom_forward
                 output = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(self.forward_body), hidden_states, context, context_mask, timestep, use_reentrant=USE_REENTRANT
+                    create_custom_forward(self.forward_body), hidden_states, context, context_mask, timestep, height, width, use_reentrant=USE_REENTRANT
                 )
         else:
-            output = self.forward_body(hidden_states, context, context_mask, timestep)
+            output = self.forward_body(hidden_states, context, context_mask, timestep, height, width)
         return output
 
 class LSTransformer2DModel(nn.Module):
@@ -1211,28 +1225,28 @@ class LSTransformer2DModel(nn.Module):
             transformer.set_use_sdpa(sdpa)
 
     def forward(self, hidden_states, encoder_hidden_states=None, context_mask=None, timestep=None):
-        batch, _, height, weight = hidden_states.shape
+        batch, _, height, width = hidden_states.shape
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
         if not self.use_linear_projection:
             hidden_states = self.proj_in(hidden_states)
             inner_dim = hidden_states.shape[1]
-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * weight, inner_dim)
+            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
         else:
             inner_dim = hidden_states.shape[1]
-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * weight, inner_dim)
+            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
             hidden_states = self.proj_in(hidden_states)
 
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, context=encoder_hidden_states, context_mask=context_mask, timestep=timestep)
+            hidden_states = block(hidden_states, context=encoder_hidden_states, context_mask=context_mask, timestep=timestep, height=height, width=width)
 
         if not self.use_linear_projection:
-            hidden_states = hidden_states.reshape(batch, height, weight, inner_dim).permute(0, 3, 1, 2).contiguous()
+            hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
             hidden_states = self.proj_out(hidden_states)
         else:
             hidden_states = self.proj_out(hidden_states)
-            hidden_states = hidden_states.reshape(batch, height, weight, inner_dim).permute(0, 3, 1, 2).contiguous()
+            hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
 
         output = hidden_states + residual
         return output
