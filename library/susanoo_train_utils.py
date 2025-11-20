@@ -14,10 +14,51 @@ from library.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 
+
+def _should_sample(args, epoch, global_step):
+    if args.sample_prompts is None:
+        return False
+
+    if global_step == 0:
+        return bool(getattr(args, "sample_at_first", False))
+
+    every_n_steps = getattr(args, "sample_every_n_steps", None)
+    every_n_epochs = getattr(args, "sample_every_n_epochs", None)
+
+    if every_n_steps is None and every_n_epochs is None:
+        return False
+
+    if every_n_epochs is not None:
+        if epoch is None or epoch % every_n_epochs != 0:
+            return False
+        return True
+
+    if every_n_steps is None:
+        return False
+
+    if global_step % every_n_steps != 0:
+        return False
+
+    # Avoid double-sampling at epoch boundaries when both triggers are enabled elsewhere
+    if epoch is not None:
+        return False
+
+    return True
+
+
+def _get_model_device(model):
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
 def add_susanoo_train_arguments(parser: argparse.ArgumentParser):
     # parser.add_argument("--tokenizer_cache_dir", type=str, default=None)
-    # parser.add_argument("--no_half_vae", action="store_true")
-    # parser.add_argument("--vae", type=str, default=None, help="Path to Flux VAE checkpoint file") # Conflict with train_util
+    if not any(action.dest == 'no_half_vae' for action in parser._actions):
+        parser.add_argument("--no_half_vae", action="store_true", help="Do not use half precision for VAE")
+    
+    if not any(action.dest == 'vae' for action in parser._actions):
+        parser.add_argument("--vae", type=str, default=None, help="Path to Flux VAE checkpoint file")
     parser.add_argument("--text_encoder_path", type=str, default=None, help="Path to Qwen model folder")
     parser.add_argument("--lsunet_path", type=str, default=None, help="Path to LSUNet checkpoint file")
     parser.add_argument("--system_prompt", type=str, default=None, help="System prompt to prepend to captions")
@@ -98,71 +139,82 @@ def save_susanoo_model(args, epoch, global_step, accelerator, unet, text_project
         save_file(proj_state_dict, proj_path, metadata=metadata)
 
 def sample_images(accelerator, args, epoch, global_step, unet, vae, text_encoder, text_projection=None):
-    if args.sample_prompts is None:
+    if not _should_sample(args, epoch, global_step):
         return
-    
+
+    if vae is None:
+        logger.warning("VAE is not available. Skipping sampling.")
+        return
+    if text_encoder is None:
+        logger.warning("Text encoder is not available. Skipping sampling.")
+        return
     if not os.path.exists(args.sample_prompts):
         logger.warning(f"Sample prompts file not found: {args.sample_prompts}")
         return
 
     logger.info(f"Sampling images at step {global_step}...")
-    
-    # Use train_util to load prompts with options
+
     prompts = train_util.load_prompts(args.sample_prompts)
-    
     save_dir = os.path.join(args.output_dir, "sample")
     os.makedirs(save_dir, exist_ok=True)
 
-    # Distributed sampling
     distributed_state = PartialState()
-    
-    # Unwrap models
+
     unet = accelerator.unwrap_model(unet)
     if text_projection is not None:
         text_projection = accelerator.unwrap_model(text_projection)
-    
-    # Switch to eval
+
     unet.eval()
     if text_projection is not None:
         text_projection.eval()
-    if vae is not None:
-        vae.to(accelerator.device)
-        vae.eval()
 
-    # Save RNG state
+    te_original_device = _get_model_device(text_encoder)
+    vae_original_device = _get_model_device(vae)
+
+    if te_original_device != accelerator.device:
+        text_encoder.to(accelerator.device)
+    if vae_original_device != accelerator.device:
+        vae.to(accelerator.device)
+    vae.eval()
+
     rng_state = torch.get_rng_state()
-    cuda_rng_state = None
-    if torch.cuda.is_available():
-        cuda_rng_state = torch.cuda.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
+    def _run_sampling(prompt_iterable):
+        for prompt_dict in prompt_iterable:
+            sample_image_inference(
+                accelerator,
+                args,
+                unet,
+                vae,
+                text_encoder,
+                text_projection,
+                save_dir,
+                prompt_dict,
+                epoch,
+                global_step,
+            )
 
     if distributed_state.num_processes <= 1:
-        for prompt_dict in prompts:
-            sample_image_inference(
-                accelerator, args, unet, vae, text_encoder, text_projection,
-                save_dir, prompt_dict, epoch, global_step
-            )
+        _run_sampling(prompts)
     else:
-        per_process_prompts = []
-        for i in range(distributed_state.num_processes):
-            per_process_prompts.append(prompts[i::distributed_state.num_processes])
-            
+        per_process_prompts = [prompts[i::distributed_state.num_processes] for i in range(distributed_state.num_processes)]
         with distributed_state.split_between_processes(per_process_prompts) as prompt_dict_lists:
-            for prompt_dict in prompt_dict_lists[0]:
-                sample_image_inference(
-                    accelerator, args, unet, vae, text_encoder, text_projection,
-                    save_dir, prompt_dict, epoch, global_step
-                )
+            _run_sampling(prompt_dict_lists[0])
 
-    # Restore RNG state
     torch.set_rng_state(rng_state)
     if cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
-        
-    # Restore train mode
+
     unet.train()
     if text_projection is not None:
         text_projection.train()
-        
+
+    if te_original_device != accelerator.device:
+        text_encoder.to(te_original_device)
+    if vae_original_device != accelerator.device:
+        vae.to(vae_original_device)
+
     clean_memory_on_device(accelerator.device)
 
 def sample_image_inference(
@@ -176,6 +228,11 @@ def sample_image_inference(
     sample_steps = prompt_dict.get("sample_steps", 20)
     scale = prompt_dict.get("scale", 1.0) # Guidance scale (CFG)
     seed = prompt_dict.get("seed")
+
+    height = max(64, height - height % 16)
+    width = max(64, width - width % 16)
+    do_cfg = scale > 1.0
+    negative_prompt = negative_prompt or ""
     
     if seed is not None:
         torch.manual_seed(seed)
@@ -187,21 +244,30 @@ def sample_image_inference(
             torch.cuda.seed()
             
     logger.info(f"Prompt: {prompt}")
+    if do_cfg:
+        logger.info(f"Negative prompt: {negative_prompt}")
     logger.info(f"Height: {height}, Width: {width}, Steps: {sample_steps}, Scale: {scale}, Seed: {seed}")
     
-    # Strategies
     tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+    prompts = [prompt]
+    if do_cfg:
+        prompts.insert(0, negative_prompt)
     
     with torch.no_grad():
-        # 1. Text Encoding
-        input_ids, attention_mask = tokenize_strategy.tokenize(prompt)
+        input_ids, attention_mask = tokenize_strategy.tokenize(prompts if len(prompts) > 1 else prompt)
         input_ids = input_ids.to(accelerator.device)
         attention_mask = attention_mask.to(accelerator.device).float()
-        
-        encoder_hidden_states = text_encoder(input_ids).last_hidden_state.to(unet.dtype)
-        
+
+        encoder_hidden_states = text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state.to(unet.dtype)
         if text_projection is not None:
             encoder_hidden_states = text_projection(encoder_hidden_states)
+
+        if do_cfg:
+            encoder_hidden_states_uncond, encoder_hidden_states = torch.chunk(encoder_hidden_states, 2, dim=0)
+            attention_mask_uncond, attention_mask = torch.chunk(attention_mask, 2, dim=0)
+        else:
+            encoder_hidden_states_uncond = None
+            attention_mask_uncond = None
 
         # 2. Latents Initialization
         latents = torch.randn(
@@ -212,38 +278,36 @@ def sample_image_inference(
         )
         
         # 3. Scheduler
-        scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
-        scheduler.set_timesteps(sample_steps)
+        # Use Flux schedule logic
+        # Flux uses (H/16)*(W/16) for image_seq_len (packed latents)
+        image_seq_len = (height // 16) * (width // 16)
+        timesteps = get_schedule(sample_steps, image_seq_len, shift=True)
         
-        # 4. Denoising Loop
-        for t in scheduler.timesteps:
-            # Model prediction
-            # Note: scheduler.timesteps are in 0-1000 range usually for Diffusers schedulers?
-            # FlowMatchEulerDiscreteScheduler in Diffusers usually works with sigmas (0-1) if configured correctly,
-            # but let's check what scheduler.timesteps returns.
-            # If we initialized with num_train_timesteps=1000, it returns 1000 down to 0.
-            # Our model expects 0-1000.
-            
-            model_pred = unet(latents, t, encoder_hidden_states, context_mask=attention_mask)
-            
-            # Handle Model Prediction Type for Inference
-            # If model predicts x0 (sigma_scaled), convert to v for scheduler
+        # 4. Denoise
+        # timesteps is list[float], convert to tensor for loop if needed, but here we iterate
+        
+        for i, (t_curr, t_next) in enumerate(zip(timesteps[:-1], timesteps[1:])):
+            t_vec = torch.full((latents.shape[0],), t_curr, dtype=unet.dtype, device=accelerator.device)
+            t_input = t_vec * 1000.0
+
+            if do_cfg:
+                latents_input = torch.cat([latents, latents], dim=0)
+                t_uncond = torch.cat([t_input, t_input], dim=0)
+                context = torch.cat([encoder_hidden_states_uncond, encoder_hidden_states], dim=0)
+                context_mask = torch.cat([attention_mask_uncond, attention_mask], dim=0)
+                model_pred = unet(latents_input, t_uncond, context, context_mask=context_mask)
+                pred_uncond, pred_text = torch.chunk(model_pred, 2, dim=0)
+                v_pred = pred_uncond + scale * (pred_text - pred_uncond)
+            else:
+                model_pred = unet(latents, t_input, encoder_hidden_states, context_mask=attention_mask)
+                v_pred = model_pred
+
             if args.model_prediction_type == "sigma_scaled":
-                # v = (x_t - x_0) / sigma
-                # sigma corresponds to t (normalized 0-1)
-                # t from scheduler is 0-1000.
-                sigma = t / 1000.0
-                
-                # Avoid division by zero at t=0
-                if sigma < 1e-5:
-                    sigma = 1e-5
-                
-                # Ensure sigma is on the correct device and broadcastable
-                # t is likely a scalar tensor, possibly on CPU
-                model_pred = (latents - model_pred) / sigma
-            
-            # Step
-            latents = scheduler.step(model_pred, t, latents).prev_sample
+                sigma_val = max(t_curr, 1e-5)
+                v_pred = (latents - v_pred) / sigma_val
+
+            dt = t_next - t_curr
+            latents = latents + dt * v_pred
 
         # 5. Decode
         if vae is not None:
@@ -319,7 +383,34 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
     b = y1 - m * x1
     return lambda x: m * x + b
 
-def get_noisy_model_input_and_timesteps(args, noise, latents, device):
+def get_schedule(
+    num_steps: int,
+    image_seq_len: int,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+    shift: bool = True,
+) -> list[float]:
+    # extra step for zero
+    timesteps = torch.linspace(1, 0, num_steps + 1)
+
+    # shifting the schedule to favor high timesteps for higher signal images
+    if shift:
+        # eastimate mu based on linear estimation between two points
+        mu = get_lin_function(y1=base_shift, y2=max_shift)(image_seq_len)
+        timesteps = time_shift(mu, 1.0, timesteps)
+
+    return timesteps.tolist()
+
+
+def scale_timesteps_to_scheduler_range(timesteps: torch.Tensor, num_train_timesteps: int) -> torch.LongTensor:
+    if timesteps.dtype.is_floating_point:
+        scaled = torch.round(timesteps * (num_train_timesteps - 1))
+    else:
+        scaled = timesteps
+    scaled = scaled.clamp(0, num_train_timesteps - 1)
+    return scaled.to(dtype=torch.long)
+
+def get_noisy_model_input_and_timesteps(args, noise, latents, device, dtype=torch.float32):
     bs, _, h, w = latents.shape
     
     # Timestep Sampling
@@ -334,22 +425,22 @@ def get_noisy_model_input_and_timesteps(args, noise, latents, device):
             
     elif args.timestep_sampling == "shift":
         # Shift Sampling (Simple shift)
-        t = torch.randn((bs,), device=device)
-        t = torch.sigmoid(t * args.sigmoid_scale)
-        timesteps = (t * args.discrete_flow_shift) / (1 + (args.discrete_flow_shift - 1) * t)
+        sigmas = torch.randn((bs,), device=device)
+        sigmas = torch.sigmoid(sigmas * args.sigmoid_scale)
+        timesteps = (sigmas * args.discrete_flow_shift) / (1 + (args.discrete_flow_shift - 1) * sigmas)
         
     elif args.timestep_sampling == "flux_shift":
         # Flux Shift Sampling (Uniform with shift)
         # Flux uses simple uniform sampling t ~ U[0,1] then applies shift
-        t = torch.randn((bs,), device=device)
-        t = torch.sigmoid(t * args.sigmoid_scale)
+        sigmas = torch.randn((bs,), device=device)
+        sigmas = torch.sigmoid(sigmas * args.sigmoid_scale)
         
         # Flux uses packed latents size for shift calculation. 
         # Here we use latent size directly. 
         # Flux: (h//2) * (w//2) where h, w are latent dims.
         # So it is (H/16)*(W/16).
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
-        timesteps = time_shift(mu, 1.0, t)
+        timesteps = time_shift(mu, 1.0, sigmas)
         
     else:
         # "sigma" or fallback
@@ -370,9 +461,18 @@ def get_noisy_model_input_and_timesteps(args, noise, latents, device):
     # x_t = (1 - t) * x_0 + t * x_1
     # sigmas = t in this formulation
     sigmas = timesteps.view(bs, 1, 1, 1)
-    noisy_latents = (1 - sigmas) * latents + sigmas * noise
     
-    return noisy_latents, timesteps, sigmas
+    if hasattr(args, "ip_noise_gamma") and args.ip_noise_gamma:
+        xi = torch.randn_like(latents, device=latents.device, dtype=dtype)
+        if hasattr(args, "ip_noise_gamma_random_strength") and args.ip_noise_gamma_random_strength:
+            ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma
+        else:
+            ip_noise_gamma = args.ip_noise_gamma
+        noisy_latents = (1.0 - sigmas) * latents + sigmas * (noise + ip_noise_gamma * xi)
+    else:
+        noisy_latents = (1 - sigmas) * latents + sigmas * noise
+    
+    return noisy_latents.to(dtype), timesteps.to(dtype), sigmas
 
 def apply_model_prediction_type(args, model_pred, noisy_latents, sigmas):
     weighting = None

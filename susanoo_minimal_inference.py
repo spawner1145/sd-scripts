@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 from library import susanoo_models, susanoo_utils, strategy_susanoo
 from library.susanoo_train_utils import get_lin_function, time_shift
+from diffusers import FlowMatchEulerDiscreteScheduler
 
 def get_schedule(
     num_steps: int,
@@ -44,7 +45,7 @@ def get_schedule(
 
     # shifting the schedule to favor high timesteps for higher signal images
     if shift:
-        # estimate mu based on linear estimation between two points
+        # eastimate mu based on linear estimation between two points
         mu = get_lin_function(y1=base_shift, y2=max_shift)(image_seq_len)
         timesteps = time_shift(mu, 1.0, timesteps)
 
@@ -121,21 +122,18 @@ def generate_image(
         model.to(device)
 
     # 3. Schedule
-    # Flux shift logic
-    # image_seq_len for Flux is (h//2)*(w//2).
-    # For Susanoo, let's use the same logic as in train_utils: (H/16)*(W/16)
-    # latent_height = H/8.
-    # So (latent_height // 2) * (latent_width // 2)
-    image_seq_len = (latent_height // 2) * (latent_width // 2)
+    # Use Flux schedule logic
+    # Flux uses (H/16)*(W/16) for image_seq_len (packed latents)
+    image_seq_len = (height // 16) * (width // 16)
     timesteps = get_schedule(steps, image_seq_len, shift=True)
-
+    
     # 4. Denoise
     with torch.no_grad():
         # Use autocast for mixed precision (especially if model is fp8 or bf16)
         # We use the device type for autocast (e.g. 'cuda')
         autocast_device = device.type if device.type != "mps" else "cpu" # MPS autocast might differ, but usually 'cuda' or 'cpu'
         
-        for i, (t_curr, t_prev) in enumerate(zip(tqdm(timesteps[:-1]), timesteps[1:])):
+        for i, (t_curr, t_next) in enumerate(zip(tqdm(timesteps[:-1]), timesteps[1:])):
             t_vec = torch.full((latents.shape[0],), t_curr, dtype=dtype, device=device)
             t_input = t_vec * 1000.0
             
@@ -159,8 +157,11 @@ def generate_image(
                 v_pred = model_pred
 
             # Euler Step
-            dt = t_prev - t_curr
+            dt = t_next - t_curr
             latents = latents + dt * v_pred
+            
+            if i % 5 == 0:
+                logger.info(f"Step {i}: Latents Mean={latents.mean().item():.4f}, Std={latents.std().item():.4f}, Min={latents.min().item():.4f}, Max={latents.max().item():.4f}")
 
     if args.offload:
         logger.info("Moving Model to CPU and VAE to GPU...")
@@ -170,8 +171,15 @@ def generate_image(
 
     # 5. Decode
     # Flux VAE decode
+    logger.info(f"Decoding latents: Shape={latents.shape}, Mean={latents.mean().item():.4f}, Std={latents.std().item():.4f}")
+    
+    # Manual scaling fix attempt (if model output is unscaled)
+    # latents = latents / latents.std() * 0.3611
+    
     with torch.no_grad():
         image = vae.decode(latents)
+    
+    logger.info(f"Decoded Image: Mean={image.mean().item():.4f}, Std={image.std().item():.4f}, Min={image.min().item():.4f}, Max={image.max().item():.4f}")
     
     image = image.clamp(-1, 1)
     image = (image + 1) / 2
@@ -201,16 +209,21 @@ def main():
     parser.add_argument("--lora_weights", type=str, nargs="*", default=[], help="LoRA weights, can be multiple. Format: path or path;multiplier")
     parser.add_argument("--merge_lora_weights", action="store_true", help="Merge LoRA weights to model")
     parser.add_argument("--max_token_length", type=int, default=512, help="Max token length for tokenizer")
+    parser.add_argument("--discrete_flow_shift", type=float, default=3.0, help="Shift value for FlowMatchEulerDiscreteScheduler")
     
     args = parser.parse_args()
     
     device = torch.device(args.device)
     
-    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "float32": torch.float32}
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "float32": torch.float32, "fp32": torch.float32}
     if hasattr(torch, "float8_e4m3fn"):
         dtype_map["fp8"] = torch.float8_e4m3fn
     
     dtype = dtype_map.get(args.dtype)
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if args.dtype == "fp8" and dtype is fp8_dtype:
+        logger.warning("FP8 execution is experimental for Susanoo. Falling back to bf16 for computation.")
+        dtype = torch.bfloat16
     if dtype is None:
         if args.dtype == "fp8":
             logger.warning("FP8 requested but torch.float8_e4m3fn is not available. Falling back to bf16.")

@@ -36,6 +36,10 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(32)
 
+        if getattr(args, "huber_schedule", None) == "snr" and args.loss_type in {"huber", "smooth_l1"}:
+            logger.warning("huber_schedule='snr' is not supported for Susanoo FlowMatch training. Falling back to 'exponential'.")
+            args.huber_schedule = "exponential"
+
     def prepare_text_encoder_grad_ckpt_workaround(self, index, text_encoder):
         if hasattr(text_encoder, "model") and hasattr(text_encoder.model, "embed_tokens"):
             text_encoder.model.embed_tokens.requires_grad_(True)
@@ -108,7 +112,7 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
         
         # Get noisy latents and timesteps using Susanoo utils (Flow Matching logic)
         noisy_latents, timesteps, sigmas = susanoo_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise, latents, accelerator.device
+            args, noise, latents, accelerator.device, weight_dtype
         )
 
         # ensure the hidden state will require grad
@@ -146,17 +150,11 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
         # If raw, model_pred (v) stays v
         model_pred, weighting = susanoo_train_utils.apply_model_prediction_type(args, model_pred, noisy_latents, sigmas)
 
+        discrete_timesteps = susanoo_train_utils.scale_timesteps_to_scheduler_range(
+            timesteps, noise_scheduler.config.num_train_timesteps
+        )
 
-        # We return None for weighting here because train_network.py handles loss calculation differently.
-        # However, train_network.py calculates MSE(pred, target).
-        # If we want weighted loss, we might need to adjust.
-        # For now, we assume standard MSE on v-prediction is sufficient or weighting is handled by min_snr_gamma etc in base class.
-        # But base class min_snr is for diffusion.
-        # If we want to support "sigma_sqrt" etc, we should probably return it?
-        # train_network.py doesn't accept weighting from here easily without modifying train loop.
-        # But let's stick to basic Flow Matching loss for now.
-        
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, discrete_timesteps, weighting
 
     def get_tokenize_strategy(self, args):
         return strategy_susanoo.SusanooTokenizeStrategy(args.text_encoder_path, args.max_token_length or 512, args.system_prompt)

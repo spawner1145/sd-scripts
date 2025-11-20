@@ -4,6 +4,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import argparse
 import math
 import os
+import random
 from multiprocessing import Value
 from typing import List
 import toml
@@ -21,11 +22,11 @@ import library.train_util as train_util
 from library.utils import setup_logging, add_logging_arguments
 from library.config_util import ConfigSanitizer, BlueprintGenerator
 import library.config_util as config_util
-import library.custom_train_functions as custom_train_functions
 from safetensors.torch import save_file
 
 # Import Susanoo libraries
 from library import susanoo_utils, susanoo_train_utils
+from library.custom_train_functions import apply_masked_loss
 
 setup_logging()
 import logging
@@ -36,6 +37,8 @@ def train(args):
     train_util.prepare_dataset_args(args, True)
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
+
+    args.session_id = random.randint(0, 2**32)
 
     cache_latents = args.cache_latents
     
@@ -62,15 +65,19 @@ def train(args):
         if args.dataset_config is not None:
             user_config = config_util.load_user_config(args.dataset_config)
         else:
+            if args.in_json:
+                subset = {"image_dir": args.train_data_dir, "metadata_file": args.in_json}
+                subsets = [subset]
+            else:
+                subsets = config_util.generate_dreambooth_subsets_config_by_subdirs(args.train_data_dir, args.reg_data_dir)
+                if len(subsets) == 0:
+                    subset = {"image_dir": args.train_data_dir}
+                    subsets = [subset]
+            
             user_config = {
                 "datasets": [
                     {
-                        "subsets": [
-                            {
-                                "image_dir": args.train_data_dir,
-                                "metadata_file": args.in_json,
-                            }
-                        ]
+                        "subsets": subsets
                     }
                 ]
             }
@@ -87,6 +94,10 @@ def train(args):
     train_dataset_group.set_current_strategies()
     train_dataset_group.verify_bucket_reso_steps(32)
 
+    if len(train_dataset_group) == 0:
+        logger.error("No data found. Please check your train_data_dir and make sure it contains images.")
+        raise ValueError("No data found. Please check your train_data_dir and make sure it contains images.")
+
     if args.debug_dataset:
         train_util.debug_dataset(train_dataset_group, True)
         return
@@ -96,16 +107,18 @@ def train(args):
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
 
     # Cache Latents if requested
+    vae = None
     if args.cache_latents:
         logger.info("Loading Flux VAE for latent caching...")
         vae = susanoo_utils.load_vae(args.vae, vae_dtype, accelerator.device)
-        
         train_dataset_group.new_cache_latents(vae, accelerator)
-        
-        # Unload VAE to free memory
         vae.to("cpu")
+        vae.eval()
         clean_memory_on_device(accelerator.device)
-        del vae
+    else:
+        vae = susanoo_utils.load_vae(args.vae, vae_dtype, accelerator.device)
+        vae.to(accelerator.device, dtype=vae_dtype)
+        vae.eval()
 
     # Text Encoding Strategy
     text_encoding_strategy = strategy_susanoo.SusanooTextEncodingStrategy()
@@ -113,53 +126,22 @@ def train(args):
 
     # Load Models
     # 1. Text Encoder (Qwen)
-    text_encoder = None
+    text_encoder = susanoo_utils.load_text_encoder(args.text_encoder_path, weight_dtype, accelerator.device)
     if args.cache_text_encoder_outputs:
-        # Load for caching
-        text_encoder = susanoo_utils.load_text_encoder(args.text_encoder_path, weight_dtype, accelerator.device)
-        
-        # Setup Caching Strategy
         text_encoder_caching_strategy = strategy_susanoo.SusanooTextEncoderOutputsCachingStrategy(
             args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check
         )
         strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_caching_strategy)
-        
-        # Run Caching
+
         with accelerator.autocast():
             train_dataset_group.new_cache_text_encoder_outputs([text_encoder], accelerator)
-            
-        # Cache sample prompts
-        if args.sample_prompts is not None:
-            logger.info(f"cache Text Encoder outputs for sample prompt: {args.sample_prompts}")
-            prompts = train_util.load_prompts(args.sample_prompts)
-            sample_prompts_te_outputs = {}
-            with accelerator.autocast(), torch.no_grad():
-                for prompt_dict in prompts:
-                    for p in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", "")]:
-                        if p not in sample_prompts_te_outputs:
-                            logger.info(f"cache Text Encoder outputs for prompt: {p}")
-                            input_ids, attention_mask = susanoo_tokenize_strategy.tokenize(p)
-                            input_ids = input_ids.to(accelerator.device)
-                            out = text_encoder(input_ids).last_hidden_state.to("cpu").to(weight_dtype)
-                            sample_prompts_te_outputs[p] = out
 
-        # Unload
         text_encoder.to("cpu")
+        text_encoder.eval()
         clean_memory_on_device(accelerator.device)
-        del text_encoder
-        text_encoder = None
     else:
-        # Load for training
-        text_encoder = susanoo_utils.load_text_encoder(args.text_encoder_path, weight_dtype, accelerator.device)
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-        sample_prompts_te_outputs = None
-
-    # 2. VAE (Flux)
-    vae = None
-    if not args.cache_latents:
-        vae = susanoo_utils.load_vae(args.vae, vae_dtype, accelerator.device)
-        vae.to(accelerator.device, dtype=vae_dtype)
-        vae.eval()
+        text_encoder.eval()
 
     # 3. UNet (LSUNet)
     if args.lsunet_path:
@@ -168,8 +150,9 @@ def train(args):
         unet = susanoo_utils.create_lsunet(weight_dtype, accelerator.device)
     
     if args.gradient_checkpointing:
-        # unet.enable_gradient_checkpointing(cpu_offload=args.cpu_offload_checkpointing)
-        unet.enable_gradient_checkpointing()
+        unet.enable_gradient_checkpointing(cpu_offload=args.cpu_offload_checkpointing)
+
+    unet.requires_grad_(True)
 
     # 4. Text Projection (Optional/Fallback)
     # Check dimensions
@@ -186,11 +169,19 @@ def train(args):
     text_projection = None
     if text_enc_dim != unet_context_dim or args.text_projection:
         text_projection = susanoo_utils.create_text_projection(text_enc_dim, unet_context_dim, weight_dtype, accelerator.device)
+        text_projection.requires_grad_(True)
 
     # Optimizer
     trainable_params = list(unet.parameters())
     if text_projection is not None:
         trainable_params += list(text_projection.parameters())
+
+    # Calculate number of trainable parameters
+    n_params = 0
+    for p in trainable_params:
+        if p.requires_grad:
+            n_params += p.numel()
+    accelerator.print(f"number of trainable parameters: {n_params}")
         
     if args.blockwise_fused_optimizers:
         # Group parameters for blockwise optimization
@@ -261,24 +252,94 @@ def train(args):
         train_dataset_group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=n_workers, persistent_workers=args.persistent_data_loader_workers
     )
 
+    # Calculate max train steps
+    if args.max_train_epochs is not None:
+        args.max_train_steps = args.max_train_epochs * math.ceil(
+            len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+        )
+        accelerator.print(
+            f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
+        )
+
+    # Send max train steps to dataset
+    train_dataset_group.set_max_train_steps(args.max_train_steps)
+
+    # LR Scheduler
+    if args.blockwise_fused_optimizers:
+        # prepare lr schedulers for each optimizer
+        lr_schedulers = [train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes) for optimizer in optimizers]
+        lr_scheduler = lr_schedulers[0]  # avoid error in the following code
+    else:
+        lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+
+    # Experimental: Full FP16/BF16 training
+    if args.full_fp16:
+        assert (
+            args.mixed_precision == "fp16"
+        ), "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
+        accelerator.print("enable full fp16 training.")
+        unet.to(weight_dtype)
+        if text_projection is not None:
+            text_projection.to(weight_dtype)
+        if text_encoder is not None:
+            text_encoder.to(weight_dtype)
+    elif args.full_bf16:
+        assert (
+            args.mixed_precision == "bf16"
+        ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
+        accelerator.print("enable full bf16 training.")
+        unet.to(weight_dtype)
+        if text_projection is not None:
+            text_projection.to(weight_dtype)
+        if text_encoder is not None:
+            text_encoder.to(weight_dtype)
+
     # Scheduler (Flow Matching)
     # Initialize scheduler with discrete_flow_shift
     noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
+    if getattr(args, "huber_schedule", None) == "snr" and args.loss_type in {"huber", "smooth_l1"}:
+        logger.warning("huber_schedule='snr' is not supported with the FlowMatch scheduler. Falling back to 'exponential'.")
+        args.huber_schedule = "exponential"
 
     # Training Loop
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("susanoo_train", config=vars(args))
+        tracker_config = train_util.get_sanitized_config_or_none(args)
+        accelerator.init_trackers("susanoo_train", config=tracker_config)
 
-    if text_projection is not None:
-        unet, text_projection, optimizer, train_dataloader = accelerator.prepare(unet, text_projection, optimizer, train_dataloader)
+    if args.deepspeed:
+        ds_model = deepspeed_utils.prepare_deepspeed_model(
+            args,
+            unet=unet,
+            text_projection=text_projection if text_projection is not None else None,
+        )
+        # most of ZeRO stage uses optimizer partitioning, so we have to prepare optimizer and ds_model at the same time.
+        if text_projection is not None:
+             ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                ds_model, optimizer, train_dataloader, lr_scheduler
+            )
+        else:
+             ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                ds_model, optimizer, train_dataloader, lr_scheduler
+            )
+        training_models = [ds_model]
     else:
-        unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_dataloader)
+        if text_projection is not None:
+            unet, text_projection, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, text_projection, optimizer, train_dataloader, lr_scheduler)
+        else:
+            unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)
+
+    # Experimental: Patch accelerator for fp16 training
+    if args.full_fp16:
+        train_util.patch_accelerator_for_fp16_training(accelerator)
 
     # Resume from checkpoint
     train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+
+    # Sample at first
+    susanoo_train_utils.sample_images(accelerator, args, 0, 0, unet, vae, text_encoder, text_projection)
 
     global_step = 0
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -365,31 +426,48 @@ def train(args):
 
                 # Apply Model Prediction Type
                 model_pred, weighting = susanoo_train_utils.apply_model_prediction_type(args, model_pred, noisy_latents, sigmas)
-                
-                # 7. Loss
-                target = target.float()
-                model_pred = model_pred.float()
-                
+
+                discrete_timesteps = susanoo_train_utils.scale_timesteps_to_scheduler_range(
+                    timesteps, noise_scheduler.config.num_train_timesteps
+                )
+                huber_c = train_util.get_huber_threshold_if_needed(args, discrete_timesteps, noise_scheduler)
+
+                loss = train_util.conditional_loss(
+                    model_pred.float(), target.float(), args.loss_type, "none", huber_c
+                )
+
                 if weighting is not None:
-                    loss = weighting.float() * (model_pred - target) ** 2
-                else:
-                    loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
-                
+                    loss = loss * weighting.float()
+
+                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    loss = apply_masked_loss(loss, batch)
+
                 loss = loss.mean([1, 2, 3])
 
                 if "loss_weights" in batch:
                     loss_weights = batch["loss_weights"]
                     loss = loss * loss_weights
-                
+
                 loss = loss.mean()
 
                 accelerator.backward(loss)
+                
+                if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                    params_to_clip = []
+                    params_to_clip.extend(unet.parameters())
+                    if text_projection is not None:
+                        params_to_clip.extend(text_projection.parameters())
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
                 if args.blockwise_fused_optimizers:
                     for opt in optimizers:
                         opt.step()
                         opt.zero_grad()
+                    for scheduler in lr_schedulers:
+                        scheduler.step()
                 else:
                     optimizer.step()
+                    lr_scheduler.step()
                     optimizer.zero_grad()
 
             if accelerator.sync_gradients:
@@ -408,14 +486,14 @@ def train(args):
                     if accelerator.is_main_process:
                         metadata = {
                             "ss_base_model_version": "susanoo_v1",
-                            "ss_session_id": args.session_id,
+                            "ss_session_id": str(args.session_id),
                         }
                         susanoo_train_utils.save_susanoo_model(args, epoch + 1, global_step, accelerator, unet, text_projection, save_dtype=save_dtype, metadata=metadata)
             
             current_loss = loss.detach().item()
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss}
-                # train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=True) # TODO: Add LR scheduler support
+                train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=True)
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -437,7 +515,7 @@ def train(args):
             if accelerator.is_main_process:
                 metadata = {
                     "ss_base_model_version": "susanoo_v1",
-                    "ss_session_id": args.session_id,
+                    "ss_session_id": str(args.session_id),
                 }
                 susanoo_train_utils.save_susanoo_model(args, epoch + 1, global_step, accelerator, unet, text_projection, save_dtype=save_dtype, metadata=metadata)
         
@@ -453,7 +531,7 @@ def train(args):
     if accelerator.is_main_process:
         metadata = {
             "ss_base_model_version": "susanoo_v1",
-            "ss_session_id": args.session_id,
+            "ss_session_id": str(args.session_id),
         }
         susanoo_train_utils.save_susanoo_model_on_train_end(args, save_dtype, epoch, global_step, unet, text_projection)
         logger.info("model saved.")
@@ -471,6 +549,12 @@ def setup_parser() -> argparse.ArgumentParser:
     
     susanoo_train_utils.add_susanoo_train_arguments(parser)
     
+    parser.add_argument(
+        "--cpu_offload_checkpointing",
+        action="store_true",
+        help="[EXPERIMENTAL] enable offloading of tensors to CPU during checkpointing / チェックポイント時にテンソルをCPUにオフロードする",
+    )
+
     return parser
 
 if __name__ == "__main__":
