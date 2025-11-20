@@ -156,7 +156,7 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
         # train_network.py doesn't accept weighting from here easily without modifying train loop.
         # But let's stick to basic Flow Matching loss for now.
         
-        return model_pred, target, timesteps, None
+        return model_pred, target, timesteps, weighting
 
     def get_tokenize_strategy(self, args):
         return strategy_susanoo.SusanooTokenizeStrategy(args.text_encoder_path, args.max_token_length or 512, args.system_prompt)

@@ -300,45 +300,47 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
 def get_noisy_model_input_and_timesteps(args, noise, latents, device):
     bs, _, h, w = latents.shape
     
-    # Advanced Sampling with Density (SD3/Flux style)
-    if hasattr(args, "weighting_scheme") and args.weighting_scheme in ["logit_normal", "mode"]:
-        u = compute_density_for_timestep_sampling(
-            weighting_scheme=args.weighting_scheme,
-            batch_size=bs,
-            logit_mean=args.logit_mean,
-            logit_std=args.logit_std,
-            mode_scale=args.mode_scale,
-        )
-        # Map u [0, 1] to timesteps [0, 1]
-        # Note: Flux uses discrete timesteps from scheduler, but here we use continuous [0, 1]
-        # If we want to match Flux exactly, we might need to map to discrete steps, but continuous is fine for Flow Matching usually.
-        timesteps = u.to(device)
-    else:
-        # Timestep Sampling
-        if args.timestep_sampling == "sigma" or args.timestep_sampling == "uniform":
-            # Simple Uniform Sampling t \in [0, 1]
-            timesteps = torch.rand((bs,), device=device)
-        elif args.timestep_sampling == "sigmoid":
+    # Timestep Sampling
+    if args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
+        # Simple Uniform Sampling t \in [0, 1]
+        if args.timestep_sampling == "sigmoid":
             # Sigmoid Sampling (used in some advanced configs)
             t = torch.randn((bs,), device=device)
             timesteps = torch.sigmoid(t * args.sigmoid_scale)
-        elif args.timestep_sampling == "shift":
-            # Shift Sampling (Simple shift)
-            t = torch.randn((bs,), device=device)
-            t = torch.sigmoid(t * args.sigmoid_scale)
-            timesteps = (t * args.discrete_flow_shift) / (1 + (args.discrete_flow_shift - 1) * t)
-        elif args.timestep_sampling == "flux_shift":
-            # Flux Shift Sampling (Uniform with shift)
-            # Flux uses simple uniform sampling t ~ U[0,1] then applies shift
-            t = torch.randn((bs,), device=device)
-            t = torch.sigmoid(t * args.sigmoid_scale)
+        else:
+            timesteps = torch.rand((bs,), device=device)
             
-            # Flux uses packed latents size for shift calculation. 
-            # Here we use latent size directly. 
-            # Flux: (h//2) * (w//2) where h, w are latent dims.
-            # So it is (H/16)*(W/16).
-            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
-            timesteps = time_shift(mu, 1.0, t)
+    elif args.timestep_sampling == "shift":
+        # Shift Sampling (Simple shift)
+        t = torch.randn((bs,), device=device)
+        t = torch.sigmoid(t * args.sigmoid_scale)
+        timesteps = (t * args.discrete_flow_shift) / (1 + (args.discrete_flow_shift - 1) * t)
+        
+    elif args.timestep_sampling == "flux_shift":
+        # Flux Shift Sampling (Uniform with shift)
+        # Flux uses simple uniform sampling t ~ U[0,1] then applies shift
+        t = torch.randn((bs,), device=device)
+        t = torch.sigmoid(t * args.sigmoid_scale)
+        
+        # Flux uses packed latents size for shift calculation. 
+        # Here we use latent size directly. 
+        # Flux: (h//2) * (w//2) where h, w are latent dims.
+        # So it is (H/16)*(W/16).
+        mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+        timesteps = time_shift(mu, 1.0, t)
+        
+    else:
+        # "sigma" or fallback
+        # Advanced Sampling with Density (SD3/Flux style)
+        if hasattr(args, "weighting_scheme") and args.weighting_scheme in ["logit_normal", "mode"]:
+            u = compute_density_for_timestep_sampling(
+                weighting_scheme=args.weighting_scheme,
+                batch_size=bs,
+                logit_mean=args.logit_mean,
+                logit_std=args.logit_std,
+                mode_scale=args.mode_scale,
+            )
+            timesteps = u.to(device)
         else:
             timesteps = torch.rand((bs,), device=device)
 

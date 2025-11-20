@@ -371,9 +371,17 @@ def train(args):
                 model_pred = model_pred.float()
                 
                 if weighting is not None:
-                    loss = torch.mean(weighting.float() * (model_pred - target) ** 2)
+                    loss = weighting.float() * (model_pred - target) ** 2
                 else:
-                    loss = torch.nn.functional.mse_loss(model_pred, target, reduction="mean")
+                    loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                
+                loss = loss.mean([1, 2, 3])
+
+                if "loss_weights" in batch:
+                    loss_weights = batch["loss_weights"]
+                    loss = loss * loss_weights
+                
+                loss = loss.mean()
 
                 accelerator.backward(loss)
                 if args.blockwise_fused_optimizers:
