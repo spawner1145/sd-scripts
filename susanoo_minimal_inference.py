@@ -6,8 +6,9 @@ import os
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import random
 import time
-from typing import Callable, List, Optional
+from typing import Optional
 import importlib
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -30,26 +31,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from library import susanoo_models, susanoo_utils, strategy_susanoo
-from library.susanoo_train_utils import get_lin_function, time_shift
-from diffusers import FlowMatchEulerDiscreteScheduler
-
-def get_schedule(
-    num_steps: int,
-    image_seq_len: int,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-    shift: bool = True,
-) -> list[float]:
-    # extra step for zero
-    timesteps = torch.linspace(1, 0, num_steps + 1)
-
-    # shifting the schedule to favor high timesteps for higher signal images
-    if shift:
-        # eastimate mu based on linear estimation between two points
-        mu = get_lin_function(y1=base_shift, y2=max_shift)(image_seq_len)
-        timesteps = time_shift(mu, 1.0, timesteps)
-
-    return timesteps.tolist()
+from library.susanoo_train_utils import build_inference_schedule, prepare_initial_latents, decode_latents_with_vae, load_latents_from_path
 
 def generate_image(
     args,
@@ -68,6 +50,7 @@ def generate_image(
     seed: int,
     device: torch.device,
     dtype: torch.dtype,
+    model_prediction_type: str,
 ):
     if seed is None:
         seed = random.randint(0, 2**32 - 1)
@@ -78,15 +61,17 @@ def generate_image(
         torch.cuda.manual_seed(seed)
 
     # 1. Prepare Latents
-    # Susanoo: 16 channels, downsample 8
-    latent_height = height // 8
-    latent_width = width // 8
-    
-    latents = torch.randn(
-        (1, 16, latent_height, latent_width),
-        device=device,
-        dtype=dtype,
-        generator=torch.Generator(device=device).manual_seed(seed)
+    latents_override = None
+    if getattr(args, "latents_path", None):
+        latents_override = load_latents_from_path(args.latents_path)
+
+    latents = prepare_initial_latents(
+        height,
+        width,
+        dtype,
+        device,
+        seed=seed,
+        latents=latents_override,
     )
 
     # 2. Encode Text
@@ -118,21 +103,27 @@ def generate_image(
         text_encoder.to("cpu")
         if text_projection is not None:
             text_projection.to("cpu")
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         model.to(device)
 
     # 3. Schedule
     # Use Flux schedule logic
     # Flux uses (H/16)*(W/16) for image_seq_len (packed latents)
-    image_seq_len = (height // 16) * (width // 16)
-    timesteps = get_schedule(steps, image_seq_len, shift=True)
+    image_seq_len = math.ceil(height / 16) * math.ceil(width / 16)
+    timesteps = build_inference_schedule(
+        steps,
+        image_seq_len,
+        timestep_sampling=args.timestep_sampling,
+        discrete_flow_shift=args.discrete_flow_shift,
+        sigmoid_scale=args.sigmoid_scale,
+    )
     
     # 4. Denoise
     with torch.no_grad():
-        # Use autocast for mixed precision (especially if model is fp8 or bf16)
-        # We use the device type for autocast (e.g. 'cuda')
-        autocast_device = device.type if device.type != "mps" else "cpu" # MPS autocast might differ, but usually 'cuda' or 'cpu'
-        
+        autocast_device = device.type if device.type != "mps" else "cpu"  # torch.autocast doesn't fully support mps
+        use_autocast = dtype in (torch.float16, torch.bfloat16)
+
         for i, (t_curr, t_next) in enumerate(zip(tqdm(timesteps[:-1]), timesteps[1:])):
             t_vec = torch.full((latents.shape[0],), t_curr, dtype=dtype, device=device)
             t_input = t_vec * 1000.0
@@ -146,7 +137,8 @@ def generate_image(
                 latents_input = latents
 
             # Model Prediction
-            with torch.autocast(device_type=autocast_device, dtype=dtype):
+            autocast_ctx = torch.autocast(device_type=autocast_device, dtype=dtype) if use_autocast else nullcontext()
+            with autocast_ctx:
                 model_pred = model(latents_input, t_input, context, context_mask=attention_mask)
             
             # CFG Guidance
@@ -155,6 +147,10 @@ def generate_image(
                 v_pred = pred_uncond + guidance_scale * (pred_text - pred_uncond)
             else:
                 v_pred = model_pred
+
+            if model_prediction_type == "sigma_scaled":
+                sigma_val = max(t_curr, 1e-5)
+                v_pred = (latents - v_pred) / sigma_val
 
             # Euler Step
             dt = t_next - t_curr
@@ -166,7 +162,8 @@ def generate_image(
     if args.offload:
         logger.info("Moving Model to CPU and VAE to GPU...")
         model.to("cpu")
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         vae.to(device)
 
     # 5. Decode
@@ -177,7 +174,8 @@ def generate_image(
     # latents = latents / latents.std() * 0.3611
     
     with torch.no_grad():
-        image = vae.decode(latents)
+        image = decode_latents_with_vae(vae, latents)
+        image = image[:, :, :height, :width]
     
     logger.info(f"Decoded Image: Mean={image.mean().item():.4f}, Std={image.std().item():.4f}, Min={image.min().item():.4f}, Max={image.max().item():.4f}")
     
@@ -203,6 +201,7 @@ def main():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--latents_path", type=str, default=None, help="Optional path to precomputed latents (.pt/.npy/.npz). If omitted, random latents are used")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32", "fp8"], help="Dtype")
     parser.add_argument("--offload", action="store_true", help="Offload models to CPU when not in use")
@@ -210,6 +209,24 @@ def main():
     parser.add_argument("--merge_lora_weights", action="store_true", help="Merge LoRA weights to model")
     parser.add_argument("--max_token_length", type=int, default=512, help="Max token length for tokenizer")
     parser.add_argument("--discrete_flow_shift", type=float, default=3.0, help="Shift value for FlowMatchEulerDiscreteScheduler")
+    parser.add_argument(
+        "--timestep_sampling",
+        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"],
+        default="shift",
+        help="Match the training timestep sampling strategy",
+    )
+    parser.add_argument(
+        "--sigmoid_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for sigmoid timestep sampling",
+    )
+    parser.add_argument(
+        "--model_prediction_type",
+        choices=["raw", "additive", "sigma_scaled"],
+        default="raw",
+        help="Match the training prediction type so inference interprets the model output correctly",
+    )
     
     args = parser.parse_args()
     
@@ -328,7 +345,8 @@ def main():
         args.guidance_scale,
         args.seed,
         device,
-        aux_dtype # Use aux_dtype for latents and scheduling
+        aux_dtype,  # Use aux_dtype for latents and scheduling
+        args.model_prediction_type,
     )
     
     img.save(args.output)

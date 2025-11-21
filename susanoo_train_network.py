@@ -52,10 +52,12 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
 
     def load_target_model(self, args, weight_dtype, accelerator):
         # 1. LSUNet
-        if args.lsunet_path:
-            unet = susanoo_utils.load_lsunet(args.lsunet_path, weight_dtype, accelerator.device)
-        else:
-            unet = susanoo_utils.create_lsunet(weight_dtype, accelerator.device)
+        if not args.lsunet_path:
+            raise ValueError(
+                "Susanoo LoRA training requires --lsunet_path to point to the base LSUNet checkpoint so the adapter can be merged later."
+            )
+
+        unet = susanoo_utils.load_lsunet(args.lsunet_path, weight_dtype, accelerator.device)
         
         if args.gradient_checkpointing:
             unet.enable_gradient_checkpointing()
@@ -301,7 +303,7 @@ class SusanooNetworkTrainer(train_network.NetworkTrainer):
         unet,
     ):
         susanoo_train_utils.sample_images(
-            accelerator, args, epoch, global_step, unet, vae, text_encoder, self.text_projection
+            accelerator, args, epoch, global_step, unet, vae, text_encoder, self.text_projection, self.sample_prompts_te_outputs
         )
 
 def setup_parser() -> argparse.ArgumentParser:

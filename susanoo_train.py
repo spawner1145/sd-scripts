@@ -326,10 +326,45 @@ def train(args):
             )
         training_models = [ds_model]
     else:
-        if text_projection is not None:
-            unet, text_projection, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, text_projection, optimizer, train_dataloader, lr_scheduler)
+        if args.blockwise_fused_optimizers:
+            prepare_targets = [unet]
+            if text_projection is not None:
+                prepare_targets.append(text_projection)
+
+            num_optimizers = len(optimizers)
+            num_schedulers = len(lr_schedulers)
+
+            prepare_targets.extend(optimizers)
+            prepare_targets.append(train_dataloader)
+            prepare_targets.extend(lr_schedulers)
+
+            prepared = accelerator.prepare(*prepare_targets)
+
+            idx = 0
+            unet = prepared[idx]
+            idx += 1
+            if text_projection is not None:
+                text_projection = prepared[idx]
+                idx += 1
+
+            optimizers = list(prepared[idx : idx + num_optimizers])
+            optimizer = optimizers[0]
+            idx += num_optimizers
+
+            train_dataloader = prepared[idx]
+            idx += 1
+
+            lr_schedulers = list(prepared[idx : idx + num_schedulers])
+            lr_scheduler = lr_schedulers[0]
         else:
-            unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)
+            if text_projection is not None:
+                unet, text_projection, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet, text_projection, optimizer, train_dataloader, lr_scheduler
+                )
+            else:
+                unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet, optimizer, train_dataloader, lr_scheduler
+                )
 
     # Experimental: Patch accelerator for fp16 training
     if args.full_fp16:
@@ -339,7 +374,7 @@ def train(args):
     train_util.resume_from_local_or_hf_if_specified(accelerator, args)
 
     # Sample at first
-    susanoo_train_utils.sample_images(accelerator, args, 0, 0, unet, vae, text_encoder, text_projection)
+    susanoo_train_utils.sample_images(accelerator, args, 0, 0, unet, vae, text_encoder, text_projection, None)
 
     global_step = 0
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -393,7 +428,7 @@ def train(args):
                         input_ids = input_ids.to(accelerator.device)
                         attention_mask = attention_mask.to(accelerator.device).float()
                         
-                        encoder_hidden_states = text_encoder(input_ids).last_hidden_state.to(weight_dtype)
+                        encoder_hidden_states = text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state.to(weight_dtype)
                         
                         # No pooled output
 
@@ -405,7 +440,9 @@ def train(args):
                 # 5. Sample Noise and Timesteps (Flow Matching)
                 noise = torch.randn_like(latents)
                 
-                noisy_latents, timesteps, sigmas = susanoo_train_utils.get_noisy_model_input_and_timesteps(args, noise, latents, accelerator.device)
+                noisy_latents, timesteps, sigmas = susanoo_train_utils.get_noisy_model_input_and_timesteps(
+                    args, noise, latents, accelerator.device, weight_dtype
+                )
                 
                 if args.gradient_checkpointing:
                     noisy_latents.requires_grad_(True)
@@ -477,7 +514,7 @@ def train(args):
                 optimizer_eval_fn()
                 
                 # Sample Images
-                susanoo_train_utils.sample_images(accelerator, args, epoch + 1, global_step, unet, vae, text_encoder, text_projection)
+                susanoo_train_utils.sample_images(accelerator, args, epoch + 1, global_step, unet, vae, text_encoder, text_projection, None)
                 
                 optimizer_train_fn()
 
@@ -520,7 +557,7 @@ def train(args):
                 susanoo_train_utils.save_susanoo_model(args, epoch + 1, global_step, accelerator, unet, text_projection, save_dtype=save_dtype, metadata=metadata)
         
         optimizer_eval_fn()
-        susanoo_train_utils.sample_images(accelerator, args, epoch + 1, global_step, unet, vae, text_encoder, text_projection)
+        susanoo_train_utils.sample_images(accelerator, args, epoch + 1, global_step, unet, vae, text_encoder, text_projection, None)
         optimizer_train_fn()
 
     accelerator.end_training()

@@ -5,6 +5,7 @@ from PIL import Image, ImageDraw
 import os
 import sys
 from library import susanoo_utils
+from library.susanoo_train_utils import decode_latents_with_vae
 
 def create_geometric_image(width=1024, height=1024):
     img = Image.new("RGB", (width, height), "white")
@@ -74,13 +75,31 @@ def test_vae_reconstruction():
         latents = vae.encode(input_tensor)
         print(f"Latents shape: {latents.shape}")
         
-        # Decode
-        reconstructed_tensor = vae.decode(latents)
-        print(f"Reconstructed tensor shape: {reconstructed_tensor.shape}")
+        # Decode via original API
+        reconstructed_direct = vae.decode(latents)
+        
+        # Decode via Susanoo helper (manual scaling + decoder)
+        reconstructed_helper = decode_latents_with_vae(vae, latents)
+        print(f"Reconstruction tensor shape: {reconstructed_helper.shape}")
+        
+        # Compare both decoding paths to ensure logic parity
+        diff = (reconstructed_direct - reconstructed_helper).float()
+        max_diff = diff.abs().max().item()
+        mean_diff = diff.abs().mean().item()
+        print(f"Direct vs helper decode — max diff: {max_diff:.6f}, mean diff: {mean_diff:.6f}")
+        if max_diff > 5e-4:
+            print("Warning: decode helper diverges from original vae.decode beyond tolerance!")
+        
+        reconstructed_tensor = reconstructed_helper
         
     # 5. Postprocess & Save
     reconstructed_img = postprocess_image(reconstructed_tensor)
     reconstructed_img.save("vae_test_reconstructed.png")
+    
+    # Simple reconstruction quality metrics
+    l1 = (input_tensor - reconstructed_tensor).abs().mean().item()
+    mse = torch.mean((input_tensor - reconstructed_tensor) ** 2).item()
+    print(f"Reconstruction L1 loss: {l1:.6f}, MSE: {mse:.6f}")
     
     print("Done! Saved 'vae_test_original.png' and 'vae_test_reconstructed.png'.")
 
