@@ -1,9 +1,14 @@
 import argparse
+import json
 import math
 import os
+import random
+import time
+import toml
 from typing import Optional
 
 import torch
+from PIL import Image
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -428,10 +433,237 @@ def verify_sdxl_training_args(args: argparse.Namespace, support_text_encoder_cac
 
 
 def sample_images(*args, **kwargs):
-    # SDXL 16ch AE mode does not have a compatible Diffusers pipeline for sampling right now.
+    # args layout matches train_util.sample_images_common(accelerator, args, ...)
     if len(args) > 0 and getattr(args[1], "sdxl_ae", False):
-        logger.info("skip sample_images because --sdxl_ae is enabled")
-        return None
+        return _sample_images_flux(*args, **kwargs)
     from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
 
     return train_util.sample_images_common(SdxlStableDiffusionLongPromptWeightingPipeline, *args, **kwargs)
+
+
+def _should_sample(args: argparse.Namespace, epoch: int, steps: int) -> bool:
+    if steps == 0:
+        return bool(args.sample_at_first)
+
+    if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
+        return False
+    if args.sample_every_n_epochs is not None:
+        if epoch is None or epoch % args.sample_every_n_epochs != 0:
+            return False
+    else:
+        if steps % args.sample_every_n_steps != 0 or epoch is not None:
+            return False
+    return True
+
+
+def _load_sample_prompts(sample_prompts_path: str):
+    if sample_prompts_path.endswith(".txt"):
+        with open(sample_prompts_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
+    elif sample_prompts_path.endswith(".toml"):
+        with open(sample_prompts_path, "r", encoding="utf-8") as f:
+            data = toml.load(f)
+        prompts = [dict(**data["prompt"], **subset) for subset in data["prompt"]["subset"]]
+    elif sample_prompts_path.endswith(".json"):
+        with open(sample_prompts_path, "r", encoding="utf-8") as f:
+            prompts = json.load(f)
+    else:
+        raise ValueError(f"unsupported sample prompts file: {sample_prompts_path}")
+
+    for i in range(len(prompts)):
+        prompt_dict = prompts[i]
+        if isinstance(prompt_dict, str):
+            prompt_dict = train_util.line_to_prompt_dict(prompt_dict)
+            prompts[i] = prompt_dict
+        assert isinstance(prompt_dict, dict)
+        prompt_dict["enum"] = i
+        prompt_dict.pop("subset", None)
+
+    return prompts
+
+
+def _encode_text_sdxl(tokenizers, text_encoders, device, dtype, prompt: str, prompt2: str):
+    tokenizer1, tokenizer2 = tokenizers
+    text_encoder1, text_encoder2 = text_encoders
+
+    batch_encoding = tokenizer1(
+        prompt,
+        truncation=True,
+        return_length=True,
+        return_overflowing_tokens=False,
+        padding="max_length",
+        return_tensors="pt",
+    )
+    tokens1 = batch_encoding["input_ids"].to(device)
+
+    with torch.no_grad():
+        enc_out1 = text_encoder1(tokens1, output_hidden_states=True, return_dict=True)
+        text_embedding1 = enc_out1["hidden_states"][11]
+
+    tokens2 = tokenizer2(
+        prompt2,
+        truncation=True,
+        return_length=True,
+        return_overflowing_tokens=False,
+        padding="max_length",
+        return_tensors="pt",
+    )["input_ids"].to(device)
+
+    with torch.no_grad():
+        enc_out2 = text_encoder2(tokens2, output_hidden_states=True, return_dict=True)
+        text_embedding2_penu = enc_out2["hidden_states"][-2]
+        text_embedding2_pool = enc_out2["text_embeds"]
+
+    text_embedding = torch.cat([text_embedding1, text_embedding2_penu], dim=2).to(device=device, dtype=dtype)
+    text_embedding2_pool = text_embedding2_pool.to(device=device, dtype=dtype)
+    return text_embedding, text_embedding2_pool
+
+
+def _decode_flux_images(vae, latents, vae_dtype, device):
+    latents = latents.to(device=device, dtype=vae_dtype)
+    image = vae.decode(latents)
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+    image = (image * 255).round().astype("uint8")
+    return [Image.fromarray(im) for im in image]
+
+
+def _sample_images_flux(accelerator, args, epoch, steps, device, vae, tokenizers, text_encoders, unet, *_, **__):
+    if not _should_sample(args, epoch, steps):
+        return None
+
+    if not os.path.isfile(args.sample_prompts):
+        logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
+        return None
+
+    prompts = _load_sample_prompts(args.sample_prompts)
+    logger.info("")
+    logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
+
+    # unwrap models and move to device
+    unet = accelerator.unwrap_model(unet)
+    text_encoders = [accelerator.unwrap_model(te) for te in text_encoders]
+
+    # remember devices to restore later
+    org_vae_device = vae.device
+    org_te_devices = [te.device for te in text_encoders]
+
+    vae_dtype = torch.float32 if getattr(args, "no_half_vae", False) else unet.dtype
+    vae.to(device, dtype=vae_dtype)
+
+    orig_unet_mode = unet.training
+    orig_te_modes = [te.training for te in text_encoders]
+
+    for te in text_encoders:
+        te.to(device, dtype=unet.dtype)
+        te.eval()
+    unet.to(device)
+    unet.eval()
+
+    save_dir = os.path.join(args.output_dir, "sample")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # save random state
+    rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
+    for prompt_dict in prompts:
+        assert isinstance(prompt_dict, dict)
+        prompt = prompt_dict.get("prompt", "")
+        prompt2 = prompt_dict.get("prompt2", prompt)
+        negative_prompt = prompt_dict.get("negative_prompt", "")
+        sample_steps = prompt_dict.get("sample_steps", 30)
+        sampler_name = prompt_dict.get("sample_sampler", args.sample_sampler)
+        scale = prompt_dict.get("scale", prompt_dict.get("guidance_scale", 7.5))
+        seed = prompt_dict.get("seed")
+
+        height = prompt_dict.get("height", 1024)
+        width = prompt_dict.get("width", 1024)
+        height = max(64, height - height % 8)
+        width = max(64, width - width % 8)
+
+        if seed is not None:
+            random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+
+        scheduler = train_util.get_my_scheduler(
+            sample_sampler=sampler_name,
+            v_parameterization=args.v_parameterization,
+        )
+        scheduler.set_timesteps(sample_steps, device)
+
+        # encode text
+        c_ctx, c_ctx_pool = _encode_text_sdxl(tokenizers, text_encoders, device, unet.dtype, prompt, prompt2)
+        uc_ctx, uc_ctx_pool = _encode_text_sdxl(tokenizers, text_encoders, device, unet.dtype, negative_prompt, negative_prompt)
+
+        size_embeddings = get_size_embeddings(
+            torch.tensor([[height, width]], device=device),
+            torch.tensor([[0, 0]], device=device),
+            torch.tensor([[height, width]], device=device),
+            device,
+        ).to(dtype=unet.dtype)
+
+        c_vector = torch.cat([c_ctx_pool, size_embeddings], dim=1)
+        uc_vector = torch.cat([uc_ctx_pool, size_embeddings], dim=1)
+
+        text_embeddings = torch.cat([uc_ctx, c_ctx])
+        vector_embeddings = torch.cat([uc_vector, c_vector])
+
+        latent_channels = sdxl_ae_util.FLUX_VAE_LATENT_CHANNELS
+        latent_scale = sdxl_ae_util.FLUX_VAE_LATENT_MULT
+        latents = torch.randn(
+            (1, latent_channels, height // 8, width // 8),
+            device=device,
+            dtype=unet.dtype,
+        )
+        latents = latents * scheduler.init_noise_sigma
+
+        timesteps = scheduler.timesteps.to(device)
+        with torch.no_grad():
+            for t in timesteps:
+                latent_model_input = latents.repeat((2, 1, 1, 1))
+                latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+
+                noise_pred = unet(latent_model_input, t, text_embeddings, vector_embeddings)
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + scale * (noise_pred_text - noise_pred_uncond)
+
+                latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+            latents = latents / latent_scale
+
+        images = _decode_flux_images(vae, latents, vae_dtype, device)
+
+        ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+        seed_suffix = "" if seed is None else f"_{seed}"
+        i = prompt_dict.get("enum", 0)
+        img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+        images[0].save(os.path.join(save_dir, img_filename))
+
+        if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+            wandb_tracker = accelerator.get_tracker("wandb")
+            import wandb
+
+            wandb_tracker.log({f"sample_{i}": wandb.Image(images[0], caption=prompt)}, commit=False)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # restore RNG and devices
+    torch.set_rng_state(rng_state)
+    if torch.cuda.is_available() and cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state)
+
+    vae.to(org_vae_device)
+    for te, org_dev, mode in zip(text_encoders, org_te_devices, orig_te_modes):
+        te.to(org_dev)
+        te.train(mode)
+    unet.train(orig_unet_mode)
+
+    clean_memory_on_device(device)
+
+    return None
