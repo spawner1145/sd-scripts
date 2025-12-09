@@ -624,15 +624,15 @@ def _sample_images_flux(accelerator, args, epoch, steps, device, vae, tokenizers
         timesteps = scheduler.timesteps.to(device)
         with torch.no_grad():
             for t in timesteps:
-            latent_model_input = latents.repeat((2, 1, 1, 1))
-            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-            latent_model_input = latent_model_input.to(unet.dtype)
+                latent_model_input = latents.repeat((2, 1, 1, 1))
+                latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+                latent_model_input = latent_model_input.to(unet.dtype)
 
-            t_in = t.to(unet.dtype)
-            te = text_embeddings.to(unet.dtype)
-            ve = vector_embeddings.to(unet.dtype)
+                t_in = t.to(unet.dtype)
+                te = text_embeddings.to(unet.dtype)
+                ve = vector_embeddings.to(unet.dtype)
 
-            noise_pred = unet(latent_model_input, t_in, te, ve)
+                noise_pred = unet(latent_model_input, t_in, te, ve)
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + scale * (noise_pred_text - noise_pred_uncond)
 
