@@ -17,7 +17,7 @@ init_ipex()
 
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
-from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec
+from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec, strategy_flux
 
 import library.train_util as train_util
 
@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 import library.config_util as config_util
 import library.sdxl_train_util as sdxl_train_util
+from library import sdxl_ae_util
 from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
@@ -44,6 +45,7 @@ from library.custom_train_functions import (
     apply_masked_loss,
 )
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from library import sdxl_ae_util
 
 
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
@@ -75,6 +77,19 @@ def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List
         params_to_optimize.append({"params": params, "lr": block_lrs[i]})
 
     return params_to_optimize
+
+
+# layers that adapt SDXL UNet to Flux 16ch latents
+UNET_VAE_MAPPING_KEYS = {"input_blocks.0.0.weight", "out.2.weight", "out.2.bias"}
+
+
+def apply_unet_adapt_freeze(accelerator, unet, train_unet: bool, adapt_active: bool):
+    if not train_unet or unet is None:
+        return
+    target_unet = accelerator.unwrap_model(unet)
+    for name, param in target_unet.named_parameters():
+        keep = train_unet and ((name in UNET_VAE_MAPPING_KEYS) or (not adapt_active))
+        param.requires_grad_(keep)
 
 
 def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
@@ -119,6 +134,8 @@ def train(args):
         block_lrs = None
 
     cache_latents = args.cache_latents
+    use_flux_ae = getattr(args, "sdxl_ae", False) or getattr(args, "sdxl_ae_path", None) is not None
+    adapt_epochs = max(0, int(getattr(args, "adapt_epoch", 0) or 0))
     use_dreambooth_method = args.in_json is None
 
     if args.seed is not None:
@@ -130,9 +147,14 @@ def train(args):
 
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:
-        latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
-            False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
-        )
+        if getattr(args, "sdxl_ae", False):
+            latents_caching_strategy = strategy_flux.FluxLatentsCachingStrategy(
+                args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            )
+        else:
+            latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
+                False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            )
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
     # データセットを準備する
@@ -214,6 +236,7 @@ def train(args):
     # mixed precisionに対応した型を用意しておき適宜castする
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
+    vae_scaling_factor = sdxl_ae_util.FLUX_VAE_LATENT_MULT if use_flux_ae else sdxl_model_util.VAE_SCALE_FACTOR
 
     # モデルを読み込む
     (
@@ -243,6 +266,12 @@ def train(args):
         use_safetensors = args.use_safetensors or ("safetensors" in args.save_model_as.lower())
         # assert save_stable_diffusion_format, "save_model_as must be ckpt or safetensors / save_model_asはckptかsafetensorsである必要があります"
 
+    if use_flux_ae:
+        # Flux AE branch cannot export Diffusers; force ckpt/safetensors path and prefer safetensors for clarity.
+        save_stable_diffusion_format = True
+        if args.save_model_as is None:
+            use_safetensors = True
+
     # Diffusers版のxformers使用フラグを設定する関数
     def set_diffusers_xformers_flag(model, valid):
         def fn_recursive_set_mem_eff(module: torch.nn.Module):
@@ -259,12 +288,13 @@ def train(args):
         # もうU-Netを独自にしたので動かないけどVAEのxformersは動くはず
         accelerator.print("Use xformers by Diffusers")
         # set_diffusers_xformers_flag(unet, True)
-        set_diffusers_xformers_flag(vae, True)
+        if not use_flux_ae:
+            set_diffusers_xformers_flag(vae, True)
     else:
         # Windows版のxformersはfloatで学習できなかったりするのでxformersを使わない設定も可能にしておく必要がある
         accelerator.print("Disable Diffusers' xformers")
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
-        if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
+        if torch.__version__ >= "2.0.0" and not use_flux_ae:
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
     # 学習を準備する
@@ -339,6 +369,8 @@ def train(args):
         vae.to(accelerator.device, dtype=vae_dtype)
 
     unet.requires_grad_(train_unet)
+    initial_adapt = adapt_epochs > 0
+    apply_unet_adapt_freeze(accelerator, unet, train_unet, initial_adapt)
     if not train_unet:
         unet.to(accelerator.device, dtype=weight_dtype)  # because of unet is not prepared
 
@@ -627,6 +659,9 @@ def train(args):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
 
+        adapt_phase = adapt_epochs > 0 and epoch < adapt_epochs
+        apply_unet_adapt_freeze(accelerator, unet, train_unet, adapt_phase)
+
         for m in training_models:
             m.train()
 
@@ -642,13 +677,17 @@ def train(args):
                 else:
                     with torch.no_grad():
                         # latentに変換
-                        latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
+                        if use_flux_ae:
+                            latents = vae.encode(batch["images"].to(vae_dtype)).to(weight_dtype)
+                        else:
+                            latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
 
                         # NaNが含まれていれば警告を表示し0に置き換える
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
-                latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
+                if vae_scaling_factor is not None:
+                    latents = latents * vae_scaling_factor
 
                 text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
                 if text_encoder_outputs_list is not None:
@@ -938,6 +977,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="number of optimizers for fused backward pass and optimizer step / fused backward passとoptimizer stepのためのoptimizer数",
+    )
+    parser.add_argument(
+        "--adapt_epoch",
+        type=int,
+        default=0,
+        help="when >0, train only UNet VAE-mapping layers for the first N epochs before full training / 最初のNエポックはUNetのVAE対応層のみ学習",
     )
     return parser
 

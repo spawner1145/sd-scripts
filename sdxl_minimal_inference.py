@@ -22,7 +22,7 @@ from PIL import Image
 # import open_clip
 from safetensors.torch import load_file
 
-from library import model_util, sdxl_model_util
+from library import model_util, sdxl_model_util, sdxl_ae_util, flux_utils
 import networks.lora as lora
 from library.utils import setup_logging
 
@@ -109,6 +109,8 @@ if __name__ == "__main__":
         help="LoRA weights, only supports networks.lora, each argument is a `path;multiplier` (semi-colon separated)",
     )
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--sdxl_ae", action="store_true", help="Enable Flux 16ch VAE branch")
+    parser.add_argument("--sdxl_ae_path", type=str, default=None, help="Path to Flux VAE safetensors file")
     args = parser.parse_args()
 
     if args.prompt2 is None:
@@ -121,11 +123,23 @@ if __name__ == "__main__":
     # checkpointを読み込む。モデル変換についてはそちらの関数を参照
     # Load checkpoint. For model conversion, see this function
 
+    use_flux_ae = args.sdxl_ae or args.sdxl_ae_path is not None
+
     # 本体RAMが少ない場合はGPUにロードするといいかも
     # If the main RAM is small, it may be better to load it on the GPU
     text_model1, text_model2, vae, unet, _, _ = sdxl_model_util.load_models_from_sdxl_checkpoint(
-        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.ckpt_path, "cpu"
+        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0,
+        args.ckpt_path,
+        "cpu",
+        use_flux_ae=use_flux_ae,
+        ae_channels=sdxl_ae_util.FLUX_VAE_LATENT_CHANNELS if use_flux_ae else None,
     )
+
+    if use_flux_ae and vae is None:
+        target_ae = args.sdxl_ae_path
+        if target_ae is None:
+            raise ValueError("Flux AE weights are required: provide --sdxl_ae_path or use a checkpoint with flux_vae.*")
+        vae = flux_utils.load_ae(target_ae, torch.float32, "cpu", disable_mmap=True)
 
     # Text Encoder 1はSDXL本体でもHuggingFaceのものを使っている
     # In SDXL, Text Encoder 1 is also using HuggingFace's
@@ -158,7 +172,7 @@ if __name__ == "__main__":
     text_model2.eval()
 
     unet.set_use_memory_efficient_attention(True, False)
-    if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
+    if torch.__version__ >= "2.0.0" and (not use_flux_ae) and hasattr(vae, "set_use_memory_efficient_attention_xformers"):
         vae.set_use_memory_efficient_attention_xformers(True)
 
     # Tokenizers
@@ -272,7 +286,10 @@ if __name__ == "__main__":
         # get the initial random noise unless the user supplied it
         # SDXLはCPUでlatentsを作成しているので一応合わせておく、Diffusersはtarget deviceでlatentsを作成している
         # SDXL creates latents in CPU, Diffusers creates latents in target device
-        latents_shape = (1, 4, target_height // 8, target_width // 8)
+        latent_channels = sdxl_ae_util.FLUX_VAE_LATENT_CHANNELS if use_flux_ae else 4
+        latent_scale = sdxl_ae_util.FLUX_VAE_LATENT_MULT if use_flux_ae else sdxl_model_util.VAE_SCALE_FACTOR
+
+        latents_shape = (1, latent_channels, target_height // 8, target_width // 8)
         latents = torch.randn(
             latents_shape,
             generator=generator,
@@ -305,10 +322,9 @@ if __name__ == "__main__":
                 # latents = scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
                 latents = scheduler.step(noise_pred, t, latents).prev_sample
 
-            # latents = 1 / 0.18215 * latents
-            latents = 1 / sdxl_model_util.VAE_SCALE_FACTOR * latents
+            latents = latents / latent_scale
             latents = latents.to(vae_dtype)
-            image = vae.decode(latents).sample
+            image = vae.decode(latents).sample if not use_flux_ae else vae.decode(latents)
             image = (image / 2 + 0.5).clamp(0, 1)
 
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16

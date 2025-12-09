@@ -4,10 +4,11 @@ from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from safetensors.torch import load_file, save_file
 from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer
-from typing import List
+from typing import List, Optional
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
 from library import sdxl_original_unet
+from library import flux_models, flux_utils, sdxl_ae_util
 from library.utils import setup_logging
 
 setup_logging()
@@ -16,6 +17,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 VAE_SCALE_FACTOR = 0.13025
+FLUX_VAE_LATENT_CHANNELS = sdxl_ae_util.FLUX_VAE_LATENT_CHANNELS
+FLUX_VAE_SCALE_FACTOR = sdxl_ae_util.FLUX_VAE_SCALE_FACTOR
 MODEL_VERSION_SDXL_BASE_V1_0 = "sdxl_base_v1-0"
 
 # Diffusersの設定を読み込むための参照モデル
@@ -166,7 +169,15 @@ def _load_state_dict_on_device(model, state_dict, device, dtype=None):
     raise RuntimeError("Error(s) in loading state_dict for {}:\n\t{}".format(model.__class__.__name__, "\n\t".join(error_msgs)))
 
 
-def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None, disable_mmap=False):
+def load_models_from_sdxl_checkpoint(
+    model_version,
+    ckpt_path,
+    map_location,
+    dtype=None,
+    disable_mmap=False,
+    use_flux_ae: bool = False,
+    ae_channels: Optional[int] = None,
+):
     # model_version is reserved for future use
     # dtype is used for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
 
@@ -194,6 +205,9 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
             global_step = 0
         checkpoint = None
 
+    if use_flux_ae:
+        sdxl_ae_util.enable_flux_vae_unet_channels(ae_channels)
+
     # U-Net
     logger.info("building U-Net")
     with init_empty_weights():
@@ -204,6 +218,8 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
     for k in list(state_dict.keys()):
         if k.startswith("model.diffusion_model."):
             unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+    if use_flux_ae:
+        unet_sd = sdxl_ae_util.upgrade_unet_state_dict_for_flux(unet_sd, ae_channels)
     info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
     logger.info(f"U-Net: {info}")
 
@@ -281,16 +297,40 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
     info2 = _load_state_dict_on_device(text_model2, converted_sd, device=map_location)  # remain fp32
     logger.info(f"text encoder 2: {info2}")
 
-    # prepare vae
-    logger.info("building VAE")
-    vae_config = model_util.create_vae_diffusers_config()
-    with init_empty_weights():
-        vae = AutoencoderKL(**vae_config)
+    flux_vae_sd = None
+    if use_flux_ae:
+        for k in list(state_dict.keys()):
+            if k.startswith("flux_vae."):
+                if flux_vae_sd is None:
+                    flux_vae_sd = {}
+                flux_vae_sd[k.replace("flux_vae.", "")] = state_dict.pop(k)
+        # drop legacy 4ch VAE weights if present to reduce memory pressure
+        if flux_vae_sd is None:
+            for k in list(state_dict.keys()):
+                if k.startswith("first_stage_model."):
+                    state_dict.pop(k)
 
-    logger.info("loading VAE from checkpoint")
-    converted_vae_checkpoint = model_util.convert_ldm_vae_checkpoint(state_dict, vae_config)
-    info = _load_state_dict_on_device(vae, converted_vae_checkpoint, device=map_location, dtype=dtype)
-    logger.info(f"VAE: {info}")
+    # prepare vae
+    if use_flux_ae:
+        if flux_vae_sd is not None:
+            logger.info("building flux VAE")
+            with init_empty_weights():
+                vae = flux_models.AutoEncoder(flux_models.configs[flux_utils.MODEL_NAME_DEV].ae_params)
+            info = _load_state_dict_on_device(vae, flux_vae_sd, device=map_location, dtype=dtype)
+            logger.info(f"Flux VAE: {info}")
+        else:
+            vae = None  # caller must provide external flux ae
+            logger.info("Flux VAE is not bundled in checkpoint; waiting for external --sdxl_ae_path")
+    else:
+        logger.info("building VAE")
+        vae_config = model_util.create_vae_diffusers_config()
+        with init_empty_weights():
+            vae = AutoencoderKL(**vae_config)
+
+        logger.info("loading VAE from checkpoint")
+        converted_vae_checkpoint = model_util.convert_ldm_vae_checkpoint(state_dict, vae_config)
+        info = _load_state_dict_on_device(vae, converted_vae_checkpoint, device=map_location, dtype=dtype)
+        logger.info(f"VAE: {info}")
 
     ckpt_info = (epoch, global_step) if epoch is not None else None
     return text_model1, text_model2, vae, unet, logit_scale, ckpt_info
@@ -508,8 +548,11 @@ def save_stable_diffusion_checkpoint(
     update_sd("conditioner.embedders.1.model.", text_enc2_dict)
 
     # Convert the VAE
-    vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
-    update_sd("first_stage_model.", vae_dict)
+    if isinstance(vae, flux_models.AutoEncoder):
+        logger.info("Skip saving Flux VAE; expect external AE file for SDXL-AE mode")
+    else:
+        vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
+        update_sd("first_stage_model.", vae_dict)
 
     # Put together new checkpoint
     key_count = len(state_dict.keys())
@@ -535,6 +578,9 @@ def save_diffusers_checkpoint(
     output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None
 ):
     from diffusers import StableDiffusionXLPipeline
+
+    if isinstance(vae, flux_models.AutoEncoder):
+        raise ValueError("Flux VAE SDXL weights cannot be exported as a Diffusers pipeline.")
 
     # convert U-Net
     unet_sd = unet.state_dict()

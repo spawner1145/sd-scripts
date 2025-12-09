@@ -11,7 +11,7 @@ init_ipex()
 from accelerate import init_empty_weights
 from tqdm import tqdm
 from transformers import CLIPTokenizer
-from library import model_util, sdxl_model_util, train_util, sdxl_original_unet
+from library import model_util, sdxl_model_util, train_util, sdxl_original_unet, sdxl_ae_util, flux_utils
 from .utils import setup_logging
 
 setup_logging()
@@ -27,6 +27,8 @@ TOKENIZER2_PATH = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 
 def load_target_model(args, accelerator, model_version: str, weight_dtype):
     model_dtype = match_mixed_precision(args, weight_dtype)  # prepare fp16/bf16
+    use_flux_ae = getattr(args, "sdxl_ae", False) or getattr(args, "sdxl_ae_path", None) is not None
+    flux_ae_path = getattr(args, "sdxl_ae_path", None)
     for pi in range(accelerator.state.num_processes):
         if pi == accelerator.state.local_process_index:
             logger.info(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
@@ -47,6 +49,8 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
                 accelerator.device if args.lowram else "cpu",
                 model_dtype,
                 args.disable_mmap_load_safetensors,
+                use_flux_ae,
+                flux_ae_path,
             )
 
             # work on low-ram device
@@ -63,7 +67,15 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
 
 
 def _load_target_model(
-    name_or_path: str, vae_path: Optional[str], model_version: str, weight_dtype, device="cpu", model_dtype=None, disable_mmap=False
+    name_or_path: str,
+    vae_path: Optional[str],
+    model_version: str,
+    weight_dtype,
+    device="cpu",
+    model_dtype=None,
+    disable_mmap=False,
+    use_flux_ae: bool = False,
+    flux_ae_path: Optional[str] = None,
 ):
     # model_dtype only work with full fp16/bf16
     name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
@@ -78,7 +90,15 @@ def _load_target_model(
             unet,
             logit_scale,
             ckpt_info,
-        ) = sdxl_model_util.load_models_from_sdxl_checkpoint(model_version, name_or_path, device, model_dtype, disable_mmap)
+        ) = sdxl_model_util.load_models_from_sdxl_checkpoint(
+            model_version,
+            name_or_path,
+            device,
+            model_dtype,
+            disable_mmap,
+            use_flux_ae,
+            sdxl_ae_util.FLUX_VAE_LATENT_CHANNELS if use_flux_ae else None,
+        )
     else:
         # Diffusers model is loaded to CPU
         from diffusers import StableDiffusionXLPipeline
@@ -111,12 +131,15 @@ def _load_target_model(
         if text_encoder2.dtype != torch.float32:
             text_encoder2 = text_encoder2.to(dtype=torch.float32)
 
-        vae = pipe.vae
+        vae = pipe.vae if not use_flux_ae else None
         unet = pipe.unet
         del pipe
 
         # Diffusers U-Net to original U-Net
         state_dict = sdxl_model_util.convert_diffusers_unet_state_dict_to_sdxl(unet.state_dict())
+        if use_flux_ae:
+            sdxl_ae_util.enable_flux_vae_unet_channels()
+            state_dict = sdxl_ae_util.upgrade_unet_state_dict_for_flux(state_dict)
         with init_empty_weights():
             unet = sdxl_original_unet.SdxlUNet2DConditionModel()  # overwrite unet
         sdxl_model_util._load_state_dict_on_device(unet, state_dict, device=device, dtype=model_dtype)
@@ -126,7 +149,14 @@ def _load_target_model(
         ckpt_info = None
 
     # VAEを読み込む
-    if vae_path is not None:
+    if use_flux_ae:
+        target_flux_ae = flux_ae_path if flux_ae_path is not None else vae_path
+        if target_flux_ae is not None:
+            vae = flux_utils.load_ae(target_flux_ae, weight_dtype, device, disable_mmap=disable_mmap)
+            logger.info("flux VAE loaded")
+        elif vae is None:
+            raise ValueError("Flux VAE weights are required for --sdxl_ae mode")
+    elif vae_path is not None:
         vae = model_util.load_vae(vae_path, weight_dtype)
         logger.info("additional VAE loaded")
 
@@ -343,6 +373,17 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser, support_text_en
         action="store_true",
         help="disable mmap load for safetensors. Speed up model loading in WSL environment / safetensorsのmmapロードを無効にする。WSL環境等でモデル読み込みを高速化できる",
     )
+    parser.add_argument(
+        "--sdxl_ae",
+        action="store_true",
+        help="train SDXL with flux 16ch VAE branch / flux 16ch VAEを使ったSDXL分岐で学習する",
+    )
+    parser.add_argument(
+        "--sdxl_ae_path",
+        type=str,
+        default=None,
+        help="path to flux autoencoder weights (*.safetensors) used in --sdxl_ae mode / --sdxl_aeモードで使うflux VAEのパス",
+    )
 
 
 def verify_sdxl_training_args(args: argparse.Namespace, support_text_encoder_caching: bool = True):
@@ -376,8 +417,21 @@ def verify_sdxl_training_args(args: argparse.Namespace, support_text_encoder_cac
                 + "cache_text_encoder_outputs_to_diskが有効になっているためcache_text_encoder_outputsが有効になりました"
             )
 
+    if getattr(args, "sdxl_ae", False) or getattr(args, "sdxl_ae_path", None) is not None:
+        if not getattr(args, "sdxl_ae", False):
+            # auto enable when path is given
+            args.sdxl_ae = True
+        if args.save_model_as is not None and args.save_model_as.lower() == "diffusers":
+            raise ValueError("--sdxl_ae mode cannot export Diffusers format; use ckpt/safetensors")
+        if args.sdxl_ae_path is None and args.vae is None:
+            logger.warning("--sdxl_ae enabled but no flux VAE path supplied; ensure checkpoint already contains flux_vae.* weights")
+
 
 def sample_images(*args, **kwargs):
+    # SDXL 16ch AE mode does not have a compatible Diffusers pipeline for sampling right now.
+    if len(args) > 0 and getattr(args[1], "sdxl_ae", False):
+        logger.info("skip sample_images because --sdxl_ae is enabled")
+        return None
     from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
 
     return train_util.sample_images_common(SdxlStableDiffusionLongPromptWeightingPipeline, *args, **kwargs)
