@@ -236,19 +236,17 @@ if __name__ == "__main__":
                 # text_embedding = pipe.text_encoder.text_model.final_layer_norm(text_embedding)    # layer normは通さないらしい
 
             # text encoder 2
-            # tokens = tokenizer2(text2).to(DEVICE)
-            tokens = tokenizer2(
-                text,
+            tokens2 = tokenizer2(
+                text2,
                 truncation=True,
                 return_length=True,
                 return_overflowing_tokens=False,
                 padding="max_length",
                 return_tensors="pt",
-            )
-            tokens = batch_encoding["input_ids"].to(DEVICE)
+            )["input_ids"].to(DEVICE)
 
             with torch.no_grad():
-                enc_out = text_model2(tokens, output_hidden_states=True, return_dict=True)
+                enc_out = text_model2(tokens2, output_hidden_states=True, return_dict=True)
                 text_embedding2_penu = enc_out["hidden_states"][-2]
                 # logger.info("hidden_states2", text_embedding2_penu.shape)
                 text_embedding2_pool = enc_out["text_embeds"]  # do not support Textual Inversion
