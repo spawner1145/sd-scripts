@@ -399,15 +399,18 @@ def train(args):
                         latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
                     else:
                         imgs = batch["images"].to(vae_dtype).to(accelerator.device)
-                        # Flux VAE Encode
-                        # encode returns sampled latents, we need to scale/shift
-                        # latents = (latents - shift_factor) * scale_factor
-                        # ae_params: scale_factor=0.3611, shift_factor=0.1159
-                        
-                        # Note: flux_models.AutoEncoder.encode returns posterior.sample()
-                        # And it ALREADY applies scaling/shifting: z = scale_factor * (z - shift_factor)
-                        latents = vae.encode(imgs)
-                        
+
+                        # Respect vae_batch_size when doing on-the-fly VAE encode to avoid huge activations.
+                        vae_bs = getattr(args, "vae_batch_size", None)
+                        if vae_bs is not None and imgs.shape[0] > vae_bs:
+                            latents_list = []
+                            for i in range(0, imgs.shape[0], vae_bs):
+                                lat_chunk = vae.encode(imgs[i : i + vae_bs])
+                                latents_list.append(lat_chunk)
+                            latents = torch.cat(latents_list, dim=0)
+                        else:
+                            latents = vae.encode(imgs)
+
                         # NaN check (copied from lumina_train.py)
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
