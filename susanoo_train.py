@@ -513,8 +513,8 @@ def train(args):
                 
                 optimizer_eval_fn()
                 
-                # Sample Images
-                susanoo_train_utils.sample_images(accelerator, args, epoch + 1, global_step, unet, vae, text_encoder, text_projection, None)
+                # Sample Images (step-based triggers only; epoch-based happens after each epoch)
+                susanoo_train_utils.sample_images(accelerator, args, None, global_step, unet, vae, text_encoder, text_projection, None)
                 
                 optimizer_train_fn()
 
