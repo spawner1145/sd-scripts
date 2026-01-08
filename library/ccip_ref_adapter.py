@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from ccip_lib import ccip_batch_extract_features
 
 
 _REF_OPEN_RE = re.compile(r"<img(\d+)>")
@@ -110,7 +111,7 @@ def inject_ccip_refs_into_gemma_hidden_states(
     adapter: CCIPToGemmaAdapter,
     dtype: torch.dtype,
     max_refs: int = 3,
-    position: str = "end",
+    position: str = "begin",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Encode ref images with CCIP and append adapter tokens after text tokens.
 
@@ -120,11 +121,6 @@ def inject_ccip_refs_into_gemma_hidden_states(
 
     if not ccip_model_dir:
         return gemma_hidden_states, attention_mask
-
-    try:
-        from ccip_lib import ccip_batch_extract_features
-    except Exception as e:
-        raise RuntimeError("ccip_lib is required when --ccip_model_dir is set") from e
 
     if gemma_hidden_states.ndim != 3:
         raise ValueError(f"gemma_hidden_states must be (B,S,D), got {gemma_hidden_states.shape}")
