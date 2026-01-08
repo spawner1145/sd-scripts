@@ -112,8 +112,10 @@ accelerate launch --num_cpu_threads_per_process 2 lumina_train_network.py ^
 该模式会冻结 U-Net/DiT 与 Text Encoder 的 LoRA 模块，只优化 CCIP Adapter，并且保存 checkpoint 时**只写出 adapter 权重文件**到 `--adapter_output_path` 指定目录。
 
 关键点：
-*   需要同时指定 `--network_train_unet_only`，让 Text Encoder LoRA 不参与训练
-*   同时指定 `--train_adapter True`，并设置 `--adapter_output_path`（目录）。
+*   最简写法：指定 `--network_train_unet_only --train_dit False --train_adapter True`。
+  - `--network_train_unet_only`：冻结 Text Encoder 侧 LoRA。
+  - `--train_dit False`：冻结 DiT（U-Net）侧 LoRA（Lumina 脚本内部会自动处理，因此不必显式写 `--network_train_text_encoder_only`）。
+*   设置 `--adapter_output_path`（目录），用于输出 adapter 权重文件。
 *   仍然可以保留 `--output_dir` 用于日志/其他输出，但不会保存 LoRA/network 的 `.safetensors` checkpoint。
 
 示例命令：
@@ -132,7 +134,6 @@ accelerate launch --num_cpu_threads_per_process 2 lumina_train_network.py ^
   --train_adapter "True" ^
   --train_dit "False" ^
   --network_train_unet_only ^
-  --network_train_text_encoder_only ^
   --adapter_output_path "D:/train/output/adapter_weights" ^
   --mixed_precision "bf16" ^
   --save_precision "bf16" ^
@@ -190,7 +191,7 @@ Adapter 生成的 Image Tokens 会占用这个宝贵的长度空间。
 当你处于“仅训练 Adapter”的模式（例如冻结 DiT/UNet 和文本编码器的 LoRA，只训练 Adapter）时，脚本会只保存 Adapter 文件，不会额外保存 LoRA / network checkpoint。
 
 实践建议（确保真的“只训 adapter + 只输出 adapter 文件”）：
-*   指定：`--train_adapter True --train_dit False --network_train_unet_only --network_train_text_encoder_only`
+*   指定：`--train_adapter True --train_dit False --network_train_unet_only`
 *   并设置：`--adapter_output_path <目录>`（每个 checkpoint 会生成一个 `${ckpt_name}_ccip_adapter.safetensors`）
 
 ### 6.2 加载

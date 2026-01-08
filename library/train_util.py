@@ -124,6 +124,20 @@ def find_ref_image_paths(image_abs_path: str, max_refs: int = 3) -> list[Optiona
         results.append(found)
     return results
 
+
+def is_ref_image_path(image_path: str) -> bool:
+    """Return True if the path looks like a CCIP reference image.
+
+    We treat files named like "*_ref1.png", "*_ref2.jpg" ... as reference images.
+    These should be used only as conditioning refs and should NOT be treated as
+    training images that require captions.
+    """
+
+    p = pathlib.Path(image_path)
+    if p.suffix not in IMAGE_EXTENSIONS:
+        return False
+    return re.search(r"_ref\d+$", p.stem) is not None
+
 try:
     import pillow_avif
 
@@ -2038,12 +2052,24 @@ class DreamBoothDataset(BaseDataset):
                 # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
                 with open(info_cache_file, "r", encoding="utf-8") as f:
                     metas = json.load(f)
-                img_paths = list(metas.keys())
-                sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
+                # filter out CCIP ref images (e.g. *_ref1.png) from training samples
+                filtered_items = [(img_path, meta) for img_path, meta in metas.items() if not is_ref_image_path(img_path)]
+                num_filtered = len(metas) - len(filtered_items)
+                if num_filtered > 0:
+                    logger.info(f"skip {num_filtered} reference images (e.g. *_ref1.*) from training set: {subset.image_dir}")
+
+                img_paths = [img_path for img_path, _ in filtered_items]
+                sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for _, meta in filtered_items]
 
                 # we may need to check image size and existence of image files, but it takes time, so user should check it before training
             else:
                 img_paths = glob_images(subset.image_dir, "*")
+                # filter out CCIP ref images (e.g. *_ref1.png) from training samples
+                before = len(img_paths)
+                img_paths = [p for p in img_paths if not is_ref_image_path(p)]
+                num_filtered = before - len(img_paths)
+                if num_filtered > 0:
+                    logger.info(f"skip {num_filtered} reference images (e.g. *_ref1.*) from training set: {subset.image_dir}")
                 sizes: List[Optional[Tuple[int, int]]] = [None] * len(img_paths)
 
                 # new caching: get image size from cache files
@@ -2106,7 +2132,7 @@ class DreamBoothDataset(BaseDataset):
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
             if use_cached_info_for_subset:
-                captions = [meta["caption"] for meta in metas.values()]
+                captions = [meta["caption"] for _, meta in filtered_items]
                 missing_captions = [img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""]
             else:
                 # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
