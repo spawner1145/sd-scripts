@@ -638,6 +638,14 @@ class NetworkTrainer:
             # lazy load unet if needed. text encoders may be freed or replaced with dummy models for saving memory
             unet, text_encoders = self.load_unet_lazily(args, weight_dtype, accelerator, text_encoders)
 
+        # Parse network_args early so metadata creation can always reference net_kwargs,
+        # even when we skip network module creation (adapter-only mode).
+        net_kwargs = {}
+        if args.network_args is not None:
+            for net_arg in args.network_args:
+                key, value = net_arg.split("=", 1)
+                net_kwargs[key] = value
+
         # Adapter-only (no LoRA/LyCORIS network) mode.
         # If the user explicitly requests to train ONLY the CCIP adapter, skip importing/creating any network module.
         # Trigger condition (requested): --network_train_unet_only + --train_dit False + --train_adapter True
@@ -725,13 +733,6 @@ class NetworkTrainer:
                     module.merge_to(text_encoder, unet, weights_sd, weight_dtype, accelerator.device if args.lowram else "cpu")
 
                 accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
-
-            # prepare network
-            net_kwargs = {}
-            if args.network_args is not None:
-                for net_arg in args.network_args:
-                    key, value = net_arg.split("=", 1)
-                    net_kwargs[key] = value
 
             # if a new network is added in future, add if ~ then blocks for each network (;'∀')
             if args.dim_from_weights:
