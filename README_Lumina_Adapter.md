@@ -60,7 +60,7 @@ A photo of <img1>, smiling, wearing a hat. <img2> is standing in the background.
 | `--ccip_feat_dim` | 输入特征向量的维度 | 768 |
 | `--adapter_tokens_per_ref` | **每张参考图**生成的 Token 数量 | 32 |
 | `--adapter_inject_position` | Image Tokens 注入位置 (`begin` 或 `end`) | `begin` |
-| `--adapter_output_path` | Adapter 权重单独保存路径 (可选) | None |
+| `--adapter_output_path` | Adapter 权重单独保存**目录** (可选，每个 checkpoint 生成一个文件) | 强烈建议设置，以便分离保存 |
 | `--train_dit` | 是否训练主网络 (True/False)。设为 False 可只训 Adapter | True |
 | `--train_adapter` | 是否训练 Adapter (True/False)。设为 False 可冻结 Adapter | True |
 | `--adapter_lr` | Adapter 专用学习率。不填则默认跟随全局 LR | None |
@@ -81,7 +81,7 @@ accelerate launch --num_cpu_threads_per_process 2 lumina_train_network.py ^
     --ccip_feat_dim 768 ^
     --adapter_tokens_per_ref 32 ^
     --adapter_inject_position "begin" ^
-    --adapter_output_path "D:/train/output/adapter_only.safetensors" ^
+    --adapter_output_path "D:/train/output/adapter_weights" ^
     --train_dit "True" ^
     --mixed_precision "bf16" ^
     --save_precision "bf16" ^
@@ -146,5 +146,14 @@ Adapter 生成的 Image Tokens 会占用这个宝贵的长度空间。
 
 ## 6. 保存与加载
 
-- **保存**：Adapter 权重会默认包含在最终的 `.safetensors` (网络权重) 中。如果你指定了 `--adapter_output_path`，它还会被单独保存一份。
-- **加载**：使用 `--adapter_model_path` 可以加载之前训练好的 Adapter 权重继续微调或进行推理。
+### 6.1 保存
+
+- **LoRA / network 权重**：仍按原逻辑保存到 `--output_dir` 下的 `.safetensors`。
+- **Adapter 权重**：如果设置了 `--adapter_output_path`，会在该**目录**下按 checkpoint 名称保存为独立文件（因此通常会有多个文件）。
+- **严格分离**：Adapter 权重不会写入 LoRA / network 的 `.safetensors` 文件中。
+
+当你处于“仅训练 Adapter”的模式（例如冻结 DiT/UNet 和文本编码器的 LoRA，只训练 Adapter）时，脚本会只保存 Adapter 文件，不会额外保存 LoRA / network checkpoint。
+
+### 6.2 加载
+
+- 使用 `--adapter_model_path` 加载之前训练好的 Adapter 权重继续微调或进行推理。

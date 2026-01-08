@@ -756,8 +756,14 @@ class NetworkTrainer:
 
         # Optional: CCIP ref-image adapter parameters (network-agnostic)
         # Some users want to train adapter alongside LyCORIS / other network modules.
-        if getattr(args, "ccip_model_dir", None) and hasattr(network, "ccip_adapter") and getattr(network, "ccip_adapter") is not None:
-            adapter_params = [p for p in network.ccip_adapter.parameters() if p.requires_grad]
+        # Modified to look for adapter in 'self' (the trainer instance) instead of 'network' for full separation
+        adapter = getattr(self, "adapter", None)
+        if adapter is None and hasattr(network, "ccip_adapter"): 
+             # Fallback for other trainers or if attached to network
+             adapter = getattr(network, "ccip_adapter")
+
+        if getattr(args, "ccip_model_dir", None) and adapter is not None:
+            adapter_params = [p for p in adapter.parameters() if p.requires_grad]
             if len(adapter_params) > 0:
                 # default to main learning rate
                 adapter_lr = getattr(args, "adapter_lr", None)
@@ -1310,6 +1316,47 @@ class NetworkTrainer:
 
         # function for saving/removing
         def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+            # Decide whether we are in "adapter-only training" mode.
+            # In this mode, we do NOT save LoRA/network weights at all; we only save adapter files.
+            train_text_encoder = not args.network_train_unet_only
+            train_unet = not args.network_train_text_encoder_only
+            adapter_only_mode = (
+                (not train_text_encoder)
+                and (not train_unet)
+                and bool(getattr(args, "ccip_model_dir", None))
+                and bool(getattr(args, "train_adapter", True))
+            )
+
+            # Adapter save: always separate file(s) under adapter_output_path directory.
+            adapter_output_dir = getattr(args, "adapter_output_path", None)
+            adapter_to_save = getattr(self, "adapter", None)
+            if adapter_to_save is None and hasattr(unwrapped_nw, "ccip_adapter"):
+                adapter_to_save = getattr(unwrapped_nw, "ccip_adapter")
+
+            if adapter_output_dir and adapter_to_save is not None:
+                try:
+                    os.makedirs(adapter_output_dir, exist_ok=True)
+
+                    adapter_sd = adapter_to_save.state_dict()
+                    if save_dtype is not None:
+                        for k in list(adapter_sd.keys()):
+                            adapter_sd[k] = adapter_sd[k].detach().clone().to("cpu").to(save_dtype)
+
+                    # Always treat adapter_output_path as a directory.
+                    # One adapter file will be written per checkpoint name.
+                    out_path = os.path.join(adapter_output_dir, f"{ckpt_name}_ccip_adapter.safetensors")
+                    from safetensors.torch import save_file
+
+                    save_file(adapter_sd, out_path, metadata=None)
+                    accelerator.print(f"saving adapter: {out_path}")
+                except Exception as e:
+                    accelerator.print(f"warning: failed to save adapter: {e}")
+
+            if adapter_only_mode:
+                # Explicitly skip saving LoRA/network checkpoint files.
+                return
+
+            # Default: save LoRA/network weights as usual.
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -1322,38 +1369,24 @@ class NetworkTrainer:
             sai_metadata = self.get_sai_model_spec(args)
             metadata_to_save.update(sai_metadata)
 
-            unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+            # If the network module has an attached adapter submodule (for DDP/Deepspeed),
+            # temporarily remove it so adapter weights never get mixed into LoRA files.
+            saved_adapter_module = None
+            try:
+                if hasattr(unwrapped_nw, "_modules") and "ccip_adapter" in unwrapped_nw._modules:
+                    saved_adapter_module = unwrapped_nw._modules.pop("ccip_adapter")
+            except Exception:
+                saved_adapter_module = None
 
-            # Optional: save adapter weights separately
-            adapter_output_path = getattr(args, "adapter_output_path", None)
-            if adapter_output_path and hasattr(unwrapped_nw, "ccip_adapter") and getattr(unwrapped_nw, "ccip_adapter") is not None:
-                try:
-                    adapter_sd = unwrapped_nw.ccip_adapter.state_dict()
-                    if save_dtype is not None:
-                        for k in list(adapter_sd.keys()):
-                            adapter_sd[k] = adapter_sd[k].detach().clone().to("cpu").to(save_dtype)
+            try:
+                unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+            finally:
+                if saved_adapter_module is not None:
+                    try:
+                        unwrapped_nw.add_module("ccip_adapter", saved_adapter_module)
+                    except Exception:
+                        unwrapped_nw.ccip_adapter = saved_adapter_module
 
-                    out_path = adapter_output_path
-                    if os.path.isdir(out_path) or out_path.endswith(os.sep):
-                        os.makedirs(out_path, exist_ok=True)
-                        out_path = os.path.join(out_path, f"{ckpt_name}_ccip_adapter.safetensors")
-                    else:
-                        # File path case: insert ckpt_name into filename to avoid overwriting previous checkpoints
-                        dir_name = os.path.dirname(out_path) or "."
-                        base, ext = os.path.splitext(os.path.basename(out_path))
-                        os.makedirs(dir_name, exist_ok=True)
-                        out_path = os.path.join(dir_name, f"{base}_{ckpt_name}{ext}")
-
-                    if os.path.splitext(out_path)[1].lower() == ".safetensors":
-                        from safetensors.torch import save_file
-
-                        save_file(adapter_sd, out_path, metadata=None)
-                    else:
-                        torch.save(adapter_sd, out_path)
-
-                    accelerator.print(f"saving adapter: {out_path}")
-                except Exception as e:
-                    accelerator.print(f"warning: failed to save adapter: {e}")
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 

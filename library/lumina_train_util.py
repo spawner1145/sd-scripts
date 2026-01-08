@@ -1106,7 +1106,7 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
             return True
         if v in {"0", "false", "f", "no", "n", "off"}:
             return False
-        raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r}")
+            help="Optional. Directory path to save adapter weights separately (one file per checkpoint).",
 
     parser.add_argument(
         "--train_dit",

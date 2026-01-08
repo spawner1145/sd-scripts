@@ -37,6 +37,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
         self._ccip_enabled: bool = False
+        self.adapter = None
 
     def assert_extra_args(self, args, train_dataset_group, val_dataset_group):
         super().assert_extra_args(args, train_dataset_group, val_dataset_group)
@@ -277,8 +278,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 from library.ccip_ref_adapter import inject_ccip_refs_into_gemma_hidden_states
 
                 # Adapter is attached to the LoRA network module (saved/loaded with it)
-                adapter = getattr(network, "ccip_adapter", None)
-                if adapter is not None:
+                if self.adapter is not None:
                     # Do not mutate cached tensors in-place
                     gemma2_hidden_states = gemma2_hidden_states.clone()
                     
@@ -301,7 +301,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                         ref_image_paths=deserialized_paths,
                         ccip_model_dir=args.ccip_model_dir,
                         ccip_image_size=getattr(args, "ccip_image_size", 384),
-                        adapter=adapter,
+                        adapter=self.adapter,
                         dtype=weight_dtype,
                         max_refs=3,
                         position=str(getattr(args, "adapter_inject_position", "begin")),
@@ -421,9 +421,21 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 adapter.requires_grad_(False)
                 logger.info("CCIP Adapter training: FROZEN (condition only)")
 
-            # Register on the LoRA network so optimizer & saver can see it
-            network.ccip_adapter = adapter
-            network.add_module("ccip_adapter", adapter)
+            # Register adapter onto the LoRA network module so it participates in
+            # Accelerator/DDP/Deepspeed wrapping and can be saved/loaded together if desired.
+            # This does not prevent separate adapter export via --adapter_output_path.
+            try:
+                # nn.Module API
+                network.add_module("ccip_adapter", adapter)
+            except Exception:
+                # Fallback: still attach for optimizer/save logic
+                network.ccip_adapter = adapter
+
+            # Store adapter in trainer instance
+            self.adapter = adapter
+            
+            # Ensure adapter is on the correct device/dtype
+            self.adapter.to(accelerator.device, dtype=getattr(network, "dtype", None) or torch.float32)
 
             self._ccip_enabled = True
         except Exception as e:
