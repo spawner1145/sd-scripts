@@ -1422,7 +1422,16 @@ class NetworkTrainer:
 
                     # Always treat adapter_output_path as a directory.
                     # One adapter file will be written per checkpoint name.
-                    out_path = os.path.join(adapter_output_dir, f"{ckpt_name}_ccip_adapter.safetensors")
+                    # ckpt_name usually already includes an extension like ".safetensors".
+                    # Use the stem to avoid awkward names like "xxx.safetensors_ccip_adapter.safetensors".
+                    try:
+                        from pathlib import Path
+
+                        ckpt_stem = Path(str(ckpt_name)).stem
+                    except Exception:
+                        ckpt_stem = os.path.splitext(str(ckpt_name))[0]
+
+                    out_path = os.path.join(adapter_output_dir, f"{ckpt_stem}_ccip_adapter.safetensors")
                     from safetensors.torch import save_file
 
                     save_file(adapter_sd, out_path, metadata=None)
