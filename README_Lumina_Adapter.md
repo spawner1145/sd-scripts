@@ -55,7 +55,7 @@ A photo of <img1>, smiling, wearing a hat. <img2> is standing in the background.
 
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
-| `--ccip_model_dir` | CCIP 模型文件夹路径 | 必须 |
+| `--ccip_model_dir` | CCIP 模型文件夹路径 | 可选 (启用 Adapter 时必须) |
 | `--ccip_image_size` | 提取特征时的图片缩放尺寸 | 384 |
 | `--ccip_feat_dim` | 输入特征向量的维度 | 768 |
 | `--adapter_tokens_per_ref` | **每张参考图**生成的 Token 数量 | 32 |
