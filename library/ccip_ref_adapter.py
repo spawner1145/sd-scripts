@@ -74,7 +74,9 @@ class CCIPToGemmaAdapter(nn.Module):
             nn.GELU(),
             nn.Linear(out_dim, out_dim),
         )
-        self.token_embed = nn.Parameter(torch.randn(tokens_per_ref, out_dim) * 0.02)
+        # Keep initial conditioning tokens small to avoid strongly perturbing the base model at step 0,
+        # while still allowing gradients to flow (do NOT initialize to exact zeros).
+        self.token_embed = nn.Parameter(torch.randn(tokens_per_ref, out_dim) * 0.002)
         
         # Improved Post-Processing: Standard FFN (Feed-Forward Network) structure
         # Linear -> GELU -> Linear is more expressive than the previous shallow mapping.
@@ -89,6 +91,14 @@ class CCIPToGemmaAdapter(nn.Module):
         nn.init.zeros_(self.post[-1].weight)
         nn.init.zeros_(self.post[-1].bias)
 
+        # Make base_proj initially low-magnitude (but non-zero) so training starts near "no conditioning"
+        # without blocking gradients into earlier layers.
+        for m in self.base_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (N, 768) -> (N, K, 2304)"""
         if x.ndim != 2:
@@ -97,7 +107,10 @@ class CCIPToGemmaAdapter(nn.Module):
             raise ValueError(f"expected feature dim {self.in_dim} but got {x.shape[1]}")
         base = self.base_proj(x)  # (N, D)
         tokens = base[:, None, :] + self.token_embed[None, :, :]
-        return self.post(tokens)
+        # Residual FFN-style post-processing.
+        # With the last projection zero-initialized, this starts as identity-like (tokens) and
+        # avoids blocking gradients to earlier layers.
+        return tokens + self.post(tokens)
 
 
 def inject_ccip_refs_into_gemma_hidden_states(
