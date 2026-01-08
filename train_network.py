@@ -678,6 +678,11 @@ class NetworkTrainer:
                     # Return an empty list; adapter params are appended by the trainer logic later.
                     return []
 
+                def prepare_grad_etc(self, *args, **kwargs):
+                    # Called by the training loop to prepare gradients etc.
+                    # No-op because adapter params are handled separately.
+                    return
+
                 def enable_gradient_checkpointing(self):
                     return
 
