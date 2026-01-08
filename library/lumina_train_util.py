@@ -1171,3 +1171,10 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
         default=None,
         help="Learning rate for CCIP Adapter. If not set, uses the main learning rate.",
     )
+
+    parser.add_argument(
+        "--debug_adapter_grad_steps",
+        type=int,
+        default=0,
+        help="Debug: print CCIP adapter gradient stats for the first N optimizer steps (0 disables).",
+    )

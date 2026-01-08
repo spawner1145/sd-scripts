@@ -1616,6 +1616,52 @@ class NetworkTrainer:
                                     params_to_clip.extend(group.get("params", []))
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                        # Optional debug: confirm adapter receives gradients
+                        debug_steps = int(getattr(args, "debug_adapter_grad_steps", 0) or 0)
+                        if debug_steps > 0 and accelerator.is_main_process and global_step < debug_steps:
+                            adapter = getattr(self, "adapter", None)
+                            if adapter is None:
+                                try:
+                                    adapter = getattr(accelerator.unwrap_model(network), "ccip_adapter", None)
+                                except Exception:
+                                    adapter = None
+
+                            if adapter is None:
+                                accelerator.print("[debug_adapter_grad] adapter not found")
+                            else:
+                                total_sq = 0.0
+                                total_abs = 0.0
+                                total_max = 0.0
+                                total_elems = 0
+                                non_none = 0
+                                param_dtype = None
+
+                                for p in adapter.parameters():
+                                    if param_dtype is None:
+                                        param_dtype = p.dtype
+                                    g = p.grad
+                                    if g is None:
+                                        continue
+                                    non_none += 1
+                                    gf = g.detach().float()
+                                    total_sq += float(gf.pow(2).sum().item())
+                                    total_abs += float(gf.abs().sum().item())
+                                    gmax = float(gf.abs().max().item())
+                                    if gmax > total_max:
+                                        total_max = gmax
+                                    total_elems += gf.numel()
+
+                                if non_none == 0:
+                                    accelerator.print(
+                                        f"[debug_adapter_grad] step={global_step} adapter_grad=None (no ref tokens injected or injection skipped)"
+                                    )
+                                else:
+                                    grad_norm = (total_sq ** 0.5) if total_sq > 0.0 else 0.0
+                                    mean_abs = (total_abs / total_elems) if total_elems > 0 else 0.0
+                                    accelerator.print(
+                                        f"[debug_adapter_grad] step={global_step} dtype={param_dtype} grad_norm={grad_norm:.6g} mean_abs={mean_abs:.6g} max_abs={total_max:.6g} tensors_with_grad={non_none}"
+                                    )
+
                         if hasattr(network, "update_grad_norms"):
                             network.update_grad_norms()
                         if hasattr(network, "update_norms"):
