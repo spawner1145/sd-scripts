@@ -435,7 +435,9 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
             self.adapter = adapter
             
             # Ensure adapter is on the correct device/dtype
-            self.adapter.to(accelerator.device, dtype=getattr(network, "dtype", None) or torch.float32)
+            # Keep CCIP + adapter in full precision to avoid dtype mismatch under bf16/fp16 mixed precision.
+            # The resulting injected tokens will still be cast to the model's weight_dtype as needed.
+            self.adapter.to(accelerator.device, dtype=torch.float32)
 
             self._ccip_enabled = True
         except Exception as e:

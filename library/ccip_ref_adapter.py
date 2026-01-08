@@ -188,8 +188,22 @@ def inject_ccip_refs_into_gemma_hidden_states(
     feats_np = ccip_batch_extract_features(flat_paths, size=ccip_image_size, model=ccip_model_dir)
     feats = torch.from_numpy(feats_np).to(device=out_hidden.device, dtype=torch.float32)
 
-    # Adapter forward with grad enabled (we want to train it)
-    tokens = adapter(feats).to(dtype=dtype)  # (N, K, D)
+    # Adapter forward with grad enabled (we want to train it), but keep CCIP+adapter in full precision.
+    # Under mixed precision (bf16/fp16), adapter weights can be cast by surrounding .to(dtype=...) calls.
+    # That leads to matmul dtype mismatch (Float vs BFloat16). We explicitly keep adapter compute in fp32.
+    try:
+        p0 = next(adapter.parameters())
+        if p0.dtype != torch.float32 and not getattr(adapter, "_ccip_forced_fp32", False):
+            adapter.to(dtype=torch.float32)
+            setattr(adapter, "_ccip_forced_fp32", True)
+    except StopIteration:
+        pass
+
+    device_type = "cuda" if out_hidden.is_cuda else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False):
+        tokens_fp32 = adapter(feats)  # (N, K, D) float32
+
+    tokens = tokens_fp32.to(dtype=dtype)  # (N, K, D)
 
     # Group tokens per sample
     per_sample_tokens: list[list[torch.Tensor]] = [[] for _ in range(bsz)]
