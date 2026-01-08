@@ -304,7 +304,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                         adapter=adapter,
                         dtype=weight_dtype,
                         max_refs=3,
-                        position=str(getattr(args, "adapter_inject_position", "end")),
+                        position=str(getattr(args, "adapter_inject_position", "begin")),
                     )
             except Exception as e:
                 logger.warning(f"CCIP adapter injection skipped due to error: {e}")
