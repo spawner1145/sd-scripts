@@ -112,7 +112,7 @@ accelerate launch --num_cpu_threads_per_process 2 lumina_train_network.py ^
 该模式会冻结 U-Net/DiT 与 Text Encoder 的 LoRA 模块，只优化 CCIP Adapter，并且保存 checkpoint 时**只写出 adapter 权重文件**到 `--adapter_output_path` 指定目录。
 
 关键点：
-*   需要同时指定 `--network_train_unet_only` 与 `--network_train_text_encoder_only`，让两侧 LoRA 都不参与训练（两者叠加的效果是：U-Net LoRA 不训 + Text Encoder LoRA 不训）。
+*   需要同时指定 `--network_train_unet_only`，让 Text Encoder LoRA 不参与训练
 *   同时指定 `--train_adapter True`，并设置 `--adapter_output_path`（目录）。
 *   仍然可以保留 `--output_dir` 用于日志/其他输出，但不会保存 LoRA/network 的 `.safetensors` checkpoint。
 
