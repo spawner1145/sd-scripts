@@ -687,9 +687,17 @@ class NetworkTrainer:
                     return []
 
                 def prepare_grad_etc(self, *args, **kwargs):
-                    # Called by the training loop to prepare gradients etc.
-                    # No-op because adapter params are handled separately.
-                    return
+                    # Keep parity with LoRA network interface (see networks.lora_lumina).
+                    # Ensure trainable params (e.g. attached ccip_adapter) are marked trainable.
+                    self.requires_grad_(True)
+
+                def on_epoch_start(self, *args, **kwargs):
+                    # Called once per epoch by the training loop.
+                    self.train()
+
+                def get_trainable_params(self):
+                    # Used for grad clipping.
+                    return self.parameters()
 
                 def enable_gradient_checkpointing(self):
                     return
@@ -1598,7 +1606,14 @@ class NetworkTrainer:
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                            unwrapped_network = accelerator.unwrap_model(network)
+                            if hasattr(unwrapped_network, "get_trainable_params"):
+                                params_to_clip = unwrapped_network.get_trainable_params()
+                            else:
+                                # Adapter-only / minimal network mode: clip all params registered in the optimizer.
+                                params_to_clip = []
+                                for group in optimizer.param_groups:
+                                    params_to_clip.extend(group.get("params", []))
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                         if hasattr(network, "update_grad_norms"):
