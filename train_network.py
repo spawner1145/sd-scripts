@@ -638,56 +638,117 @@ class NetworkTrainer:
             # lazy load unet if needed. text encoders may be freed or replaced with dummy models for saving memory
             unet, text_encoders = self.load_unet_lazily(args, weight_dtype, accelerator, text_encoders)
 
-        # 差分追加学習のためにモデルを読み込む
-        sys.path.append(os.path.dirname(__file__))
-        accelerator.print("import network module:", args.network_module)
-        network_module = importlib.import_module(args.network_module)
+        # Adapter-only (no LoRA/LyCORIS network) mode.
+        # If the user explicitly requests to train ONLY the CCIP adapter, skip importing/creating any network module.
+        # Trigger condition (requested): --network_train_unet_only + --train_dit False + --train_adapter True
+        # Note: we also require --ccip_model_dir to be set, otherwise adapter training makes no sense.
+        adapter_only_no_network = (
+            bool(getattr(args, "network_train_unet_only", False))
+            and (getattr(args, "train_dit", True) is False)
+            and bool(getattr(args, "train_adapter", True))
+            and bool(getattr(args, "ccip_model_dir", None))
+        )
 
-        if args.base_weights is not None:
-            # base_weights が指定されている場合は、指定された重みを読み込みマージする
-            for i, weight_path in enumerate(args.base_weights):
-                if args.base_weights_multiplier is None or len(args.base_weights_multiplier) <= i:
-                    multiplier = 1.0
-                else:
-                    multiplier = args.base_weights_multiplier[i]
+        if adapter_only_no_network:
+            # Ensure downstream logic treats both TE and U-Net/DiT LoRA as frozen.
+            # This also makes save_model() enter adapter_only_mode and skip LoRA checkpoints.
+            args.network_train_text_encoder_only = True
 
-                accelerator.print(f"merging module: {weight_path} with multiplier {multiplier}")
+            # Network weights are meaningless in this mode.
+            args.network_weights = None
+            args.base_weights = None
+            args.base_weights_multiplier = None
 
-                module, weights_sd = network_module.create_network_from_weights(
-                    multiplier, weight_path, vae, text_encoder, unet, for_inference=True
-                )
-                module.merge_to(text_encoder, unet, weights_sd, weight_dtype, accelerator.device if args.lowram else "cpu")
-
-            accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
-
-        # prepare network
-        net_kwargs = {}
-        if args.network_args is not None:
-            for net_arg in args.network_args:
-                key, value = net_arg.split("=", 1)
-                net_kwargs[key] = value
-
-        # if a new network is added in future, add if ~ then blocks for each network (;'∀')
-        if args.dim_from_weights:
-            network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
-        else:
-            if "dropout" not in net_kwargs:
-                # workaround for LyCORIS (;^ω^)
-                net_kwargs["dropout"] = args.network_dropout
-
-            network = network_module.create_network(
-                1.0,
-                args.network_dim,
-                args.network_alpha,
-                vae,
-                text_encoder,
-                unet,
-                neuron_dropout=args.network_dropout,
-                **net_kwargs,
+            accelerator.print(
+                "adapter-only mode enabled: skipping network_module creation (no LoRA/LyCORIS will be built); training CCIP adapter only"
             )
-        if network is None:
-            return
-        network_has_multiplier = hasattr(network, "set_multiplier")
+
+            class AdapterOnlyNetwork(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self._multiplier = 1.0
+
+                def set_multiplier(self, v: float):
+                    self._multiplier = float(v)
+
+                def apply_to(self, *args, **kwargs):
+                    return
+
+                def prepare_optimizer_params(self, *args, **kwargs):
+                    # Return an empty list; adapter params are appended by the trainer logic later.
+                    return []
+
+                def enable_gradient_checkpointing(self):
+                    return
+
+                def load_weights(self, *args, **kwargs):
+                    return "adapter-only network: no LoRA weights"
+
+                def save_weights(self, *args, **kwargs):
+                    raise RuntimeError("adapter-only network has no LoRA weights to save")
+
+            network = AdapterOnlyNetwork()
+            network_has_multiplier = True
+        else:
+            # 差分追加学習のためにモデルを読み込む
+            if not getattr(args, "network_module", None):
+                raise ValueError("--network_module must be specified unless running adapter-only mode")
+
+            sys.path.append(os.path.dirname(__file__))
+            accelerator.print("import network module:", args.network_module)
+            network_module = importlib.import_module(args.network_module)
+
+        if adapter_only_no_network:
+            if args.base_weights is not None:
+                accelerator.print("warning: --base_weights is ignored in adapter-only mode")
+            if args.network_weights is not None:
+                accelerator.print("warning: --network_weights is ignored in adapter-only mode")
+        else:
+            if args.base_weights is not None:
+                # base_weights が指定されている場合は、指定された重みを読み込みマージする
+                for i, weight_path in enumerate(args.base_weights):
+                    if args.base_weights_multiplier is None or len(args.base_weights_multiplier) <= i:
+                        multiplier = 1.0
+                    else:
+                        multiplier = args.base_weights_multiplier[i]
+
+                    accelerator.print(f"merging module: {weight_path} with multiplier {multiplier}")
+
+                    module, weights_sd = network_module.create_network_from_weights(
+                        multiplier, weight_path, vae, text_encoder, unet, for_inference=True
+                    )
+                    module.merge_to(text_encoder, unet, weights_sd, weight_dtype, accelerator.device if args.lowram else "cpu")
+
+                accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
+
+            # prepare network
+            net_kwargs = {}
+            if args.network_args is not None:
+                for net_arg in args.network_args:
+                    key, value = net_arg.split("=", 1)
+                    net_kwargs[key] = value
+
+            # if a new network is added in future, add if ~ then blocks for each network (;'∀')
+            if args.dim_from_weights:
+                network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
+            else:
+                if "dropout" not in net_kwargs:
+                    # workaround for LyCORIS (;^ω^)
+                    net_kwargs["dropout"] = args.network_dropout
+
+                network = network_module.create_network(
+                    1.0,
+                    args.network_dim,
+                    args.network_alpha,
+                    vae,
+                    text_encoder,
+                    unet,
+                    neuron_dropout=args.network_dropout,
+                    **net_kwargs,
+                )
+            if network is None:
+                return
+            network_has_multiplier = hasattr(network, "set_multiplier")
 
         # TODO remove `hasattr` by setting up methods if not defined in the network like below  (hacky but will work):
         # if not hasattr(network, "prepare_network"):
