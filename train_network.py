@@ -1004,7 +1004,10 @@ class NetworkTrainer:
 
         del t_enc
 
-        accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
+        # Some training modes (e.g. adapter-only without LoRA/LyCORIS) may not implement network hooks.
+        unwrapped_network = accelerator.unwrap_model(network)
+        if hasattr(unwrapped_network, "prepare_grad_etc"):
+            unwrapped_network.prepare_grad_etc(text_encoder, unet)
 
         if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
             vae.requires_grad_(False)
@@ -1551,7 +1554,9 @@ class NetworkTrainer:
 
             metadata["ss_epoch"] = str(epoch + 1)
 
-            accelerator.unwrap_model(network).on_epoch_start(text_encoder, unet)  # network.train() is called here
+            unwrapped_network = accelerator.unwrap_model(network)
+            if hasattr(unwrapped_network, "on_epoch_start"):
+                unwrapped_network.on_epoch_start(text_encoder, unet)  # network.train() is called here
 
             # TRAINING
             skipped_dataloader = None
