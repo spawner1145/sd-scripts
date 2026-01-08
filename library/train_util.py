@@ -103,6 +103,27 @@ STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
+
+def find_ref_image_paths(image_abs_path: str, max_refs: int = 3) -> list[Optional[str]]:
+    """Find reference image paths next to the base image.
+
+    Naming convention: "<base>_ref{idx}.<ext>" where <base> is the image path without extension.
+    Returns a list of length max_refs with absolute paths or None.
+    """
+
+    base, _ = os.path.splitext(image_abs_path)
+    results: list[Optional[str]] = []
+    for i in range(1, max_refs + 1):
+        found = None
+        stem = f"{base}_ref{i}"
+        for ext in IMAGE_EXTENSIONS:
+            cand = stem + ext
+            if os.path.isfile(cand):
+                found = cand
+                break
+        results.append(found)
+    return results
+
 try:
     import pillow_avif
 
@@ -1569,6 +1590,7 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         text_encoder_outputs_list = []
         custom_attributes = []
+        ref_image_paths_list = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1673,6 +1695,12 @@ class BaseDataset(torch.utils.data.Dataset):
             images.append(image)
             latents_list.append(latents)
             alpha_mask_list.append(alpha_mask)
+
+            # reference images: <base>_ref{idx}.<ext>
+            try:
+                ref_image_paths_list.append(find_ref_image_paths(image_info.absolute_path, max_refs=3))
+            except Exception:
+                ref_image_paths_list.append([None, None, None])
 
             target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
 
@@ -1784,6 +1812,27 @@ class BaseDataset(torch.utils.data.Dataset):
         example["loss_weights"] = torch.FloatTensor(loss_weights)
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
+        
+        # Serialize list of paths to a single string to prevent DataLoader's default_collate
+        # from transposing the list of lists (which would mix up references across the batch).
+        # We use "|||" as a separator.
+        if ref_image_paths_list and isinstance(ref_image_paths_list[0], list):
+             # We assume batch size 1 internally in this dataset logic loop, but just in case:
+             # ref_image_paths_list is [ [p1, p2, p3] ] for the current image(s) processed in this loop.
+             # Actually BaseDataset processes a bucket slice, so it is a list of lists.
+             # We need to store a list of strings on the example to match other fields structure.
+             # wait, 'example' is for a SINGLE item in the dataset if this were a standard dataset, 
+             # but BaseDataset behaves uniquely by returning a consolidated dict for a bucket-batch.
+             # Let's verify 'example' construction. 
+             # 'input_ids_list' is stacked. 'ref_image_paths_list' should be a list of strings.
+             serialized_paths = []
+             for refs in ref_image_paths_list:
+                 # refs is [p1, p2, p3] (some might be None)
+                 s = "|||".join([(r if r else "") for r in refs])
+                 serialized_paths.append(s)
+             example["ref_image_paths"] = serialized_paths
+        else:
+             example["ref_image_paths"] = []
 
         # if one of alpha_masks is not None, we need to replace None with ones
         none_or_not = [x is None for x in alpha_mask_list]

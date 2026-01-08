@@ -1097,3 +1097,77 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
         default=None,
         help="Batch size to use for sampling, defaults to --training_batch_size value. Sample batches are bucketed by width, height, guidance scale, and seed / サンプリングに使用するバッチサイズ。デフォルトは --training_batch_size の値です。サンプルバッチは、幅、高さ、ガイダンススケール、シードによってバケット化されます",
     )
+
+    def _str_to_bool(v: str | bool) -> bool:
+        if isinstance(v, bool):
+            return v
+        v = v.strip().lower()
+        if v in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r}")
+
+    parser.add_argument(
+        "--train_dit",
+        type=_str_to_bool,
+        default=True,
+        help="whether to train DiT (LoRA on Lumina DiT). Default: True. Use '--train_dit false' to freeze DiT.",
+    )
+    
+    parser.add_argument(
+        "--train_adapter",
+        type=_str_to_bool,
+        default=True,
+        help="Whether to train the CCIP Adapter. Default: True. Set to False to freeze adapter (use it only for conditioning).",
+    )
+
+    parser.add_argument(
+        "--ccip_model_dir",
+        type=str,
+        default=None,
+        help="CCIP ONNX model folder path. If set, enables ref-image adapter training.",
+    )
+    parser.add_argument(
+        "--ccip_feat_dim",
+        type=int,
+        default=768,
+        help="CCIP feature dimension (default: 768). Set this if your CCIP-like encoder outputs a different dim.",
+    )
+    parser.add_argument(
+        "--ccip_image_size",
+        type=int,
+        default=384,
+        help="CCIP image resize size (default: 384).",
+    )
+    parser.add_argument(
+        "--adapter_model_path",
+        type=str,
+        default=None,
+        help="Optional adapter weights path (pt/safetensors). If omitted but --ccip_model_dir is set, a new adapter is initialized.",
+    )
+    parser.add_argument(
+        "--adapter_tokens_per_ref",
+        type=int,
+        default=32,
+        help="Number of conditioning tokens to allocate per reference image (default: 32).",
+    )
+    parser.add_argument(
+        "--adapter_inject_position",
+        type=str,
+        default="begin",
+        choices=["end", "begin"],
+        help="Where to place injected image-conditioning tokens in the caption sequence. 'begin' prepends (default, recommended). 'end' appends after text.",
+    )
+    parser.add_argument(
+        "--adapter_output_path",
+        type=str,
+        default=None,
+        help="Optional path to save adapter weights separately when saving checkpoints (pt/safetensors or directory).",
+    )
+    parser.add_argument(
+        "--adapter_lr",
+        type=float,
+        default=None,
+        help="Learning rate for CCIP Adapter. If not set, uses the main learning rate.",
+    )

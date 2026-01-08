@@ -55,6 +55,16 @@ class LuminaTokenizeStrategy(TokenizeStrategy):
                 token input ids, attention_masks
         """
         text = [text] if isinstance(text, str) else text
+
+        # Remove reference tags like <img1> for tokenization.
+        # We do NOT rely on these tags becoming stable tokens; they act as control signals only.
+        try:
+            from library.ccip_ref_adapter import strip_ref_tags_for_tokenization
+
+            text = [strip_ref_tags_for_tokenization(t) for t in text]
+        except Exception:
+            # If adapter module isn't available for some reason, keep raw text
+            pass
         
         # In training, we always add system prompt (is_negative=False)
         if not is_negative:

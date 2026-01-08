@@ -3,6 +3,7 @@ import copy
 from typing import Any, Tuple
 
 import torch
+import os
 
 from library.device_utils import clean_memory_on_device, init_ipex
 
@@ -35,6 +36,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
+        self._ccip_enabled: bool = False
 
     def assert_extra_args(self, args, train_dataset_group, val_dataset_group):
         super().assert_extra_args(args, train_dataset_group, val_dataset_group)
@@ -263,6 +265,50 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         # Unpack Gemma2 outputs
         gemma2_hidden_states, input_ids, gemma2_attn_mask = text_encoder_conds
 
+        # Ensure device placement for cached TE outputs
+        if isinstance(gemma2_hidden_states, torch.Tensor) and gemma2_hidden_states.device != accelerator.device:
+            gemma2_hidden_states = gemma2_hidden_states.to(accelerator.device)
+        if isinstance(gemma2_attn_mask, torch.Tensor) and gemma2_attn_mask.device != accelerator.device:
+            gemma2_attn_mask = gemma2_attn_mask.to(accelerator.device)
+
+        # Optional: inject CCIP ref-image embeddings into Gemma hidden states
+        if getattr(args, "ccip_model_dir", None):
+            try:
+                from library.ccip_ref_adapter import inject_ccip_refs_into_gemma_hidden_states
+
+                # Adapter is attached to the LoRA network module (saved/loaded with it)
+                adapter = getattr(network, "ccip_adapter", None)
+                if adapter is not None:
+                    # Do not mutate cached tensors in-place
+                    gemma2_hidden_states = gemma2_hidden_states.clone()
+                    
+                    # Deserialize ref_image_paths from "|||" separated strings
+                    raw_ref_paths = batch.get("ref_image_paths", [])
+                    deserialized_paths = []
+                    for s in raw_ref_paths:
+                        if isinstance(s, str):
+                            parts = s.split("|||")
+                            # Convert empty strings back to None
+                            deserialized_paths.append([(p if p else None) for p in parts])
+                        else:
+                            # Fallback if somehow not a string (e.g. empty list)
+                            deserialized_paths.append([])
+
+                    gemma2_hidden_states, gemma2_attn_mask = inject_ccip_refs_into_gemma_hidden_states(
+                        gemma_hidden_states=gemma2_hidden_states,
+                        attention_mask=gemma2_attn_mask,
+                        captions=batch.get("captions", []),
+                        ref_image_paths=deserialized_paths,
+                        ccip_model_dir=args.ccip_model_dir,
+                        ccip_image_size=getattr(args, "ccip_image_size", 384),
+                        adapter=adapter,
+                        dtype=weight_dtype,
+                        max_refs=3,
+                        position=str(getattr(args, "adapter_inject_position", "end")),
+                    )
+            except Exception as e:
+                logger.warning(f"CCIP adapter injection skipped due to error: {e}")
+
         def call_dit(img, gemma2_hidden_states, gemma2_attn_mask, timesteps):
             with torch.set_grad_enabled(is_train), accelerator.autocast():
                 # NextDiT forward expects (x, t, cap_feats, cap_mask)
@@ -317,6 +363,72 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
         return model_pred, target, timesteps, weighting
+
+    def post_process_network(self, args, accelerator, network, text_encoders, unet):
+        # Optionally freeze DiT LoRA training
+        if getattr(args, "train_dit", True) is False:
+            logger.info("train_dit is false: disabling DiT (U-Net) LoRA training")
+            args.network_train_text_encoder_only = True
+
+        # Optional: attach CCIP adapter to the network (so it is saved/loaded with LoRA weights)
+        ccip_model_dir = getattr(args, "ccip_model_dir", None)
+        if not ccip_model_dir:
+            self._ccip_enabled = False
+            return
+
+        try:
+            from library.ccip_ref_adapter import CCIPToGemmaAdapter
+
+            # Infer target dim from Lumina model if possible; fallback to 2304 (Gemma2-2B hidden size)
+            out_dim = 2304
+            try:
+                if hasattr(unet, "params") and getattr(unet.params, "cap_feat_dim", None) is not None:
+                    out_dim = int(unet.params.cap_feat_dim)
+            except Exception:
+                pass
+
+            adapter = CCIPToGemmaAdapter(
+                in_dim=int(getattr(args, "ccip_feat_dim", 768)),
+                out_dim=out_dim,
+                tokens_per_ref=int(getattr(args, "adapter_tokens_per_ref", 8)),
+            )
+
+            adapter_path = getattr(args, "adapter_model_path", None)
+            if adapter_path:
+                # accept a directory containing a default filename
+                if os.path.isdir(adapter_path):
+                    cand = os.path.join(adapter_path, "ccip_adapter.safetensors")
+                    if os.path.isfile(cand):
+                        adapter_path = cand
+
+                if os.path.splitext(adapter_path)[1].lower() == ".safetensors":
+                    from safetensors.torch import load_file
+
+                    sd = load_file(adapter_path)
+                else:
+                    sd = torch.load(adapter_path, map_location="cpu")
+                adapter.load_state_dict(sd, strict=True)
+                logger.info(f"Loaded CCIP adapter weights from {adapter_path}")
+            else:
+                logger.info("Initializing new CCIP adapter (no --adapter_model_path provided)")
+
+            if getattr(args, "train_adapter", True):
+                adapter.train()
+                adapter.requires_grad_(True)
+                logger.info("CCIP Adapter training: ENABLED")
+            else:
+                adapter.eval()
+                adapter.requires_grad_(False)
+                logger.info("CCIP Adapter training: FROZEN (condition only)")
+
+            # Register on the LoRA network so optimizer & saver can see it
+            network.ccip_adapter = adapter
+            network.add_module("ccip_adapter", adapter)
+
+            self._ccip_enabled = True
+        except Exception as e:
+            self._ccip_enabled = False
+            raise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss

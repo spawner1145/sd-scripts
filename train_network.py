@@ -754,6 +754,22 @@ class NetworkTrainer:
             trainable_params = network.prepare_optimizer_params(text_encoder_lr, args.unet_lr)
             lr_descriptions = None
 
+        # Optional: CCIP ref-image adapter parameters (network-agnostic)
+        # Some users want to train adapter alongside LyCORIS / other network modules.
+        if getattr(args, "ccip_model_dir", None) and hasattr(network, "ccip_adapter") and getattr(network, "ccip_adapter") is not None:
+            adapter_params = [p for p in network.ccip_adapter.parameters() if p.requires_grad]
+            if len(adapter_params) > 0:
+                # default to main learning rate
+                adapter_lr = getattr(args, "adapter_lr", None)
+                if adapter_lr is None:
+                    adapter_lr = float(getattr(args, "learning_rate", 0.0) or 0.0)
+                
+                if adapter_lr != 0.0:
+                    trainable_params.append({"params": adapter_params, "lr": adapter_lr})
+                    if lr_descriptions is not None:
+                        lr_descriptions.append("adapter")
+                    accelerator.print(f"enable CCIP adapter training, lr={adapter_lr}")
+
         # if len(trainable_params) == 0:
         #     accelerator.print("no trainable parameters found / 学習可能なパラメータが見つかりませんでした")
         # for params in trainable_params:
@@ -1307,6 +1323,37 @@ class NetworkTrainer:
             metadata_to_save.update(sai_metadata)
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+
+            # Optional: save adapter weights separately
+            adapter_output_path = getattr(args, "adapter_output_path", None)
+            if adapter_output_path and hasattr(unwrapped_nw, "ccip_adapter") and getattr(unwrapped_nw, "ccip_adapter") is not None:
+                try:
+                    adapter_sd = unwrapped_nw.ccip_adapter.state_dict()
+                    if save_dtype is not None:
+                        for k in list(adapter_sd.keys()):
+                            adapter_sd[k] = adapter_sd[k].detach().clone().to("cpu").to(save_dtype)
+
+                    out_path = adapter_output_path
+                    if os.path.isdir(out_path) or out_path.endswith(os.sep):
+                        os.makedirs(out_path, exist_ok=True)
+                        out_path = os.path.join(out_path, f"{ckpt_name}_ccip_adapter.safetensors")
+                    else:
+                        # File path case: insert ckpt_name into filename to avoid overwriting previous checkpoints
+                        dir_name = os.path.dirname(out_path) or "."
+                        base, ext = os.path.splitext(os.path.basename(out_path))
+                        os.makedirs(dir_name, exist_ok=True)
+                        out_path = os.path.join(dir_name, f"{base}_{ckpt_name}{ext}")
+
+                    if os.path.splitext(out_path)[1].lower() == ".safetensors":
+                        from safetensors.torch import save_file
+
+                        save_file(adapter_sd, out_path, metadata=None)
+                    else:
+                        torch.save(adapter_sd, out_path)
+
+                    accelerator.print(f"saving adapter: {out_path}")
+                except Exception as e:
+                    accelerator.print(f"warning: failed to save adapter: {e}")
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
